@@ -4,7 +4,7 @@
 包装多数据源的函数，避免未来函数，确保回测准确性
 """
 
-from typing import Union, List, Optional, Dict, Any, Callable, Tuple
+from typing import Union, List, Optional, Dict, Any, Callable, Tuple, cast
 import inspect
 import importlib
 from datetime import datetime, timedelta, date as Date, time as Time
@@ -48,6 +48,8 @@ def _normalize_provider_name(name: Optional[str]) -> str:
         return "miniqmt"
     if lowered in ("qmt-remote", "remote-qmt", "remote_qmt"):
         return "remote_qmt"
+    if lowered in ("mysquant", "myquant", "gm"):
+        return "mysquant"
     return lowered
 
 
@@ -69,6 +71,11 @@ def _create_provider(provider_name: Optional[str] = None, overrides: Optional[Di
         provider_cfg = dict(config.get('tushare', {}) or {})
         provider_cfg.update(overrides)
         return TushareProvider(provider_cfg)
+    if target in ('mysquant',):
+        from .providers.mysquant import MysQuantProvider
+        provider_cfg = dict(config.get('mysquant', {}) or {})
+        provider_cfg.update(overrides)
+        return MysQuantProvider(provider_cfg)
     if target in ('qmt', 'miniqmt'):
         from .providers.miniqmt import MiniQMTProvider
         provider_cfg = dict(config.get('qmt', {}) or {})
@@ -82,43 +89,6 @@ def _create_provider(provider_name: Optional[str] = None, overrides: Optional[Di
 
     raise ValueError(f"未知的数据提供者: {provider_name}")
 
-
-    """兼容聚宽风格的证券信息对象，既支持属性访问也保留字典语义。"""
-
-    __slots__ = ("code",)
-
-    def __init__(self, code: str, data: Optional[Dict[str, Any]] = None):
-        super().__init__()
-        object.__setattr__(self, "code", code)
-        if data:
-            for key, value in data.items():
-                if value is not None:
-                    super().__setitem__(key, value)
-
-        # 为常用字段设置默认值，避免属性访问时抛异常
-        for key in ("display_name", "name", "start_date", "end_date", "type", "subtype", "parent"):
-            self.setdefault(key, None)
-
-    def __getattr__(self, item: str) -> Any:
-        # 未提供的字段返回 None，贴近聚宽 SDK 的容错行为
-        return self.get(item, None)
-
-    def __setattr__(self, key: str, value: Any) -> None:
-        if key == "code":
-            object.__setattr__(self, key, value)
-        else:
-            self[key] = value
-
-    def __delattr__(self, item: str) -> None:
-        if item == "code":
-            raise AttributeError("code 字段不可删除")
-        try:
-            del self[item]
-        except KeyError as exc:
-            raise AttributeError(item) from exc
-
-    def to_dict(self) -> Dict[str, Any]:
-        return dict(self)
 
 def _ensure_auth():
     """确保数据提供者已认证"""
@@ -208,6 +178,12 @@ def _sdk_fallback_targets(provider_name: str, provider: DataProvider, method_nam
             target = getattr(mod, method_name, None)
             if target:
                 return target
+    elif normalized == "mysquant":
+        mod = _lazy_import("gm.api")
+        if mod:
+            target = getattr(mod, method_name, None)
+            if target:
+                return target
     elif normalized == "remote_qmt":
         raise AttributeError(f"{normalized} 未实现 {method_name}，且无可用的 SDK 回退路径")
 
@@ -237,7 +213,7 @@ _security_overrides_loaded = False
 _security_overrides: Dict[str, Any] = {}
 
 
-class SecurityInfo(dict):
+class SecurityInfo(dict[str, Any]):
     """兼容聚宽风格的证券信息对象，既支持属性访问也保留字典语义。"""
 
     __slots__ = ("code",)
@@ -274,6 +250,7 @@ class SecurityInfo(dict):
 
     def to_dict(self) -> Dict[str, Any]:
         return dict(self)
+
 
 def set_data_provider(provider: Union[DataProvider, str], **provider_kwargs) -> None:
     """
@@ -551,8 +528,8 @@ def _resolve_limit_ratio(security: str, info: Optional[Dict[str, Any]] = None) -
     rule = _resolve_limit_rule(security, info)
     ratio = rule.get("ratio")
     try:
-        ratio_value = float(ratio)
-    except Exception:
+        ratio_value = float(cast(Any, ratio))
+    except (TypeError, ValueError):
         return None
     if ratio_value <= 0:
         return None
@@ -560,56 +537,93 @@ def _resolve_limit_ratio(security: str, info: Optional[Dict[str, Any]] = None) -
 
 
 def _extract_close_series(df: Any, security: str) -> Optional[pd.Series]:
+    """从各种 DataFrame 格式中提取指定标的的收盘价序列。"""
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return None
 
+    # 情况1：长表格式 (time, code, close)
     if "time" in df.columns and "code" in df.columns and "close" in df.columns:
         sub = df[df["code"] == security]
         if sub.empty:
             sub = df
         series = sub.set_index("time")["close"]
-        return series
+        if isinstance(series, pd.Series):
+            return series
+        if isinstance(series, pd.DataFrame):
+            return series.squeeze()  # pyright: ignore[reportReturnType]
+        return series  # pyright: ignore[reportReturnType]
 
+    # 情况2：MultiIndex 列格式
     if isinstance(df.columns, pd.MultiIndex):
-        if ("close", security) in df.columns:
-            return df[("close", security)]
+        # 2a: 直接通过 (field, code) 索引访问
+        try:
+            result = df[("close", security)]
+            if isinstance(result, pd.Series):
+                return result
+            if isinstance(result, pd.DataFrame):
+                return result.squeeze()  # pyright: ignore[reportReturnType]
+            return result  # pyright: ignore[reportReturnType]
+        except (KeyError, IndexError):
+            pass
+
+        # 2b: 使用 xs 提取 close 字段
         try:
             block = df.xs("close", axis=1, level=0)
         except Exception:
             block = None
-        if block is not None and not block.empty:
-            if security in block.columns:
-                return block[security]
-            return block.iloc[:, 0]
 
+        if block is not None and not block.empty:
+            if isinstance(block, pd.Series):
+                return block
+            if isinstance(block, pd.DataFrame):
+                if security in block.columns:
+                    col = block[security]
+                    if isinstance(col, pd.Series):
+                        return col
+                    if isinstance(col, pd.DataFrame):
+                        return col.squeeze()  # pyright: ignore[reportReturnType]
+                    return col  # pyright: ignore[reportReturnType]
+                first_col = block.iloc[:, 0]
+                if isinstance(first_col, pd.Series):
+                    return first_col
+                if isinstance(first_col, pd.DataFrame):
+                    return first_col.squeeze()  # pyright: ignore[reportReturnType]
+                return first_col  # pyright: ignore[reportReturnType]
+
+    # 情况3：宽表格式（列=证券代码）
     if "close" in df.columns:
-        return df["close"]
+        result = df["close"]
+        if isinstance(result, pd.Series):
+            return result
+        if isinstance(result, pd.DataFrame):
+            return result.squeeze()  # pyright: ignore[reportReturnType]
+        return result  # pyright: ignore[reportReturnType]
 
     return None
 
 
-def _resolve_fq_ref_date(current_dt: Union[datetime, Date, Any], use_real_price: bool) -> Optional[Date]:
+def _resolve_fq_ref_date(current_dt: Union[datetime, Date, Any], use_real_price: bool) -> Optional[datetime]:
     """按聚宽语义返回前复权参考日期。"""
     if use_real_price:
         try:
             if isinstance(current_dt, datetime):
-                return current_dt.date()
-            if isinstance(current_dt, Date):
                 return current_dt
-            return pd.to_datetime(current_dt).date()
-        except Exception:
+            if isinstance(current_dt, Date):
+                return datetime.combine(current_dt, Time.min)
+            return pd.to_datetime(current_dt).to_pydatetime()
+        except (ValueError, TypeError):
             return None
     raw = _get_setting('fq_ref_date')
     if raw is None:
-        return Date.today()
+        return datetime.combine(Date.today(), Time.min)
     if isinstance(raw, datetime):
-        return raw.date()
-    if isinstance(raw, Date):
         return raw
+    if isinstance(raw, Date):
+        return datetime.combine(raw, Time.min)
     try:
-        return pd.to_datetime(raw).date()
-    except Exception:
-        return Date.today()
+        return pd.to_datetime(raw).to_pydatetime()
+    except (ValueError, TypeError):
+        return datetime.combine(Date.today(), Time.min)
 
 
 def _call_provider_get_price(**kwargs) -> pd.DataFrame:
@@ -678,7 +692,8 @@ def _fetch_pre_close(
 
     try:
         last_ts = series.index[-1]
-        last_date = last_ts.date() if hasattr(last_ts, "date") else None
+        last_ts_cast = cast(pd.Timestamp, last_ts)
+        last_date = last_ts_cast.date()
     except Exception:
         last_date = None
 
@@ -692,7 +707,7 @@ def _fetch_pre_close(
         value = series.iloc[-1]
 
     try:
-        return float(value)
+        return float(value)  # type: ignore[arg-type]
     except Exception:
         return None
 
@@ -766,21 +781,19 @@ class BacktestCurrentData:
             fields = ['open', 'close', 'high_limit', 'low_limit', 'paused']
 
             def _build_fetch_kwargs(freq_text: str) -> Dict[str, Any]:
-                kw = dict(
-                    security=security,
-                    end_date=current_dt,
-                    frequency=freq_text,
-                    fields=fields,
-                    count=1,
-                    fq='pre',
-                )
+                kw: Dict[str, Any] = {
+                    "security": security,
+                    "end_date": current_dt,
+                    "frequency": freq_text,
+                    "fields": fields,
+                    "count": 1,
+                    "fq": "pre",
+                }
                 pre_ref = _resolve_fq_ref_date(current_date or current_dt, use_real_price)
                 if pre_ref is not None:
-                    kw.update(
-                        prefer_engine=not force_no_engine,
-                        pre_factor_ref_date=pre_ref,
-                        force_no_engine=force_no_engine,
-                    )
+                    kw['prefer_engine'] = not force_no_engine
+                    kw['pre_factor_ref_date'] = pre_ref
+                    kw['force_no_engine'] = force_no_engine
                 return kw
 
             if use_minute:
@@ -789,41 +802,48 @@ class BacktestCurrentData:
                 df = _call_provider_get_price(**_build_fetch_kwargs('daily'))
 
             if not df.empty:
-                if 'time' in df.columns and 'code' in df.columns:
-                    row = df.iloc[-1]
-                    close_price = float(row['close']) if pd.notna(row['close']) else 0.0
-                    high_limit = float(row.get('high_limit', 0.0)) if pd.notna(row.get('high_limit', 0.0)) else 0.0
-                    low_limit = float(row.get('low_limit', 0.0)) if pd.notna(row.get('low_limit', 0.0)) else 0.0
-                    paused = bool(row.get('paused', False))
-                else:
-                    row = df.iloc[-1]
-                    close_price = float(row['close']) if pd.notna(row['close']) else 0.0
-                    if 'high_limit' in row:
-                        high_limit = float(row.get('high_limit', 0.0)) if pd.notna(row.get('high_limit', 0.0)) else 0.0
-                        low_limit = float(row.get('low_limit', 0.0)) if pd.notna(row.get('low_limit', 0.0)) else 0.0
-                        paused = bool(row.get('paused', False))
-                    else:
-                        high_limit = 0.0
-                        low_limit = 0.0
-                        paused = False
+                row = df.iloc[-1]
+                # Explicitly extract and validate each field
+                close_val = row.get('close') if hasattr(row, 'get') else row['close']
+                close_price = float(close_val) if close_val is not None and pd.notna(close_val) else 0.0  # type: ignore[arg-type]
 
-                open_price = float(row['open']) if 'open' in row and pd.notna(row['open']) else None
+                if 'high_limit' in row:
+                    high_val = row.get('high_limit', 0.0) if hasattr(row, 'get') else row.get('high_limit', 0.0)
+                    high_limit = float(high_val) if high_val is not None and pd.notna(high_val) else 0.0  # type: ignore[arg-type]
+                    low_val = row.get('low_limit', 0.0) if hasattr(row, 'get') else row.get('low_limit', 0.0)
+                    low_limit = float(low_val) if low_val is not None and pd.notna(low_val) else 0.0  # type: ignore[arg-type]
+                    paused = bool(row.get('paused', False)) if hasattr(row, 'get') else bool(row.get('paused', False))
+                else:
+                    high_limit = 0.0
+                    low_limit = 0.0
+                    paused = False
+
+                open_price: Optional[float] = None
+                if 'open' in row:
+                    open_val = row.get('open') if hasattr(row, 'get') else row['open']
+                    if open_val is not None and pd.notna(open_val):
+                        open_price = float(open_val)  # type: ignore[arg-type]
+
+                # 提取时间戳（优先使用 'time' 列，缺失则回退到索引）
                 row_timestamp: Optional[datetime] = None
-                if 'time' in row and pd.notna(row['time']):
+                if 'time' in row and pd.notna(row.get('time') if hasattr(row, 'get') else row['time']):
                     try:
-                        row_timestamp = pd.to_datetime(row['time'])
+                        time_val = row.get('time') if hasattr(row, 'get') else row['time']
+                        row_timestamp = pd.to_datetime(time_val)
                     except Exception:
                         row_timestamp = None
-                elif isinstance(df.index, pd.DatetimeIndex):
-                    row_timestamp = df.index[-1].to_pydatetime()
-                elif hasattr(df.index[-1], 'to_timestamp'):
-                    row_timestamp = df.index[-1].to_timestamp()
+                else:
+                    # 回退到 DataFrame 索引
+                    if isinstance(df.index, pd.DatetimeIndex):
+                        row_timestamp = df.index[-1].to_pydatetime()  # pyright: ignore
+                    elif hasattr(df.index[-1], 'to_timestamp'):
+                        row_timestamp = df.index[-1].to_timestamp()  # pyright: ignore
 
                 row_date = row_timestamp.date() if row_timestamp else None
                 should_use_open = (
                     open_price is not None and use_open_price_window and current_date is not None and row_date == current_date
                 )
-                last_price = open_price if should_use_open else close_price
+                last_price = cast(float, open_price if should_use_open else close_price)
 
                 high_limit, low_limit = _apply_limit_fallback(
                     security,
@@ -903,10 +923,15 @@ class LiveCurrentData:
                 raise
 
         if isinstance(snap, dict) and snap.get('last_price') is not None:
-            last_price = float(snap.get('last_price') or 0.0)
-            high_limit = float(snap.get('high_limit') or 0.0)
-            low_limit = float(snap.get('low_limit') or 0.0)
-            paused = bool(snap.get('paused') or False)
+            last_price_raw = snap.get('last_price')
+            high_limit_raw = snap.get('high_limit')
+            low_limit_raw = snap.get('low_limit')
+            paused_raw = snap.get('paused')
+
+            last_price = float(last_price_raw) if last_price_raw is not None else 0.0  # type: ignore[arg-type]
+            high_limit = float(high_limit_raw) if high_limit_raw is not None else 0.0  # type: ignore[arg-type]
+            low_limit = float(low_limit_raw) if low_limit_raw is not None else 0.0  # type: ignore[arg-type]
+            paused = bool(paused_raw) if paused_raw is not None else False
             use_real_price = _get_setting('use_real_price')
             force_no_engine = _get_setting('force_no_engine')
             high_limit, low_limit = _apply_limit_fallback(
@@ -972,7 +997,7 @@ def _coerce_datetime(value: Any) -> Optional[datetime]:
         return datetime.combine(value, Time(0, 0))
     try:
         parsed = pd.to_datetime(value)
-    except Exception:
+    except (ValueError, TypeError):
         return None
     if pd.isna(parsed):
         return None
@@ -984,20 +1009,23 @@ def _coerce_datetime(value: Any) -> Optional[datetime]:
 def _resolve_context_dt(value: Any, default_to_context: bool = True) -> Optional[datetime]:
     dt = _coerce_datetime(value)
     if dt is None and default_to_context and _current_context:
-        return _current_context.current_dt
+        return cast(datetime, _current_context.current_dt)
     return dt
 
 
 def _resolve_context_date(value: Any, default_to_context: bool = True) -> Optional[Date]:
     if value is None and default_to_context and _current_context:
-        return _current_context.current_dt.date()
+        ctx_dt = cast(datetime, _current_context.current_dt)
+        return ctx_dt.date()
     return _coerce_date(value) if value is not None else None
 
 
 def _ensure_not_future_dt(value: Optional[datetime], label: str) -> Optional[datetime]:
     if not _should_avoid_future() or value is None:
         return value
-    current_dt = _current_context.current_dt
+    if not _current_context:
+        return value
+    current_dt = cast(datetime, _current_context.current_dt)
     if value > current_dt:
         raise FutureDataError(
             f"avoid_future_data=True时，{label}({value})不能大于当前时间({current_dt})"
@@ -1008,7 +1036,9 @@ def _ensure_not_future_dt(value: Optional[datetime], label: str) -> Optional[dat
 def _ensure_not_future_date(value: Optional[Date], label: str) -> Optional[Date]:
     if not _should_avoid_future() or value is None:
         return value
-    current_date = _current_context.current_dt.date()
+    if not _current_context:
+        return value
+    current_date = cast(Date, _current_context.current_dt.date())
     if value > current_date:
         raise FutureDataError(
             f"avoid_future_data=True时，{label}({value})不能大于当前日期({current_date})"
@@ -1016,7 +1046,7 @@ def _ensure_not_future_date(value: Optional[Date], label: str) -> Optional[Date]
     return value
 
 
-_HISTORY_VIEW_UNSUPPORTED: Dict[str, set] = {
+_HISTORY_VIEW_UNSUPPORTED: Dict[str, set[str]] = {
     "miniqmt": {"get_all_securities"},
     "qmt-remote": {"get_all_securities"},
 }
@@ -1086,7 +1116,7 @@ def _coerce_date(value: Any) -> Optional[Date]:
         return value.date()
     try:
         parsed = pd.to_datetime(value)
-    except Exception:
+    except (ValueError, TypeError):
         return None
     if pd.isna(parsed):
         return None
@@ -1286,13 +1316,14 @@ def get_price(
     avoid_future = _should_avoid_future()
     use_real_price = _get_setting('use_real_price')
     
-    current_dt = _current_context.current_dt
+    # At this point, _current_context is guaranteed not None due to early return above
+    current_dt = cast(datetime, _current_context.current_dt)
     
     # 检查参数冲突：start_date 和 count 不能同时使用（与聚宽保持一致）
     if count is not None and start_date is not None:
         raise UserError("get_price 不能同时指定 start_date 和 count 两个参数")
     
-    # 处理 end_date 的默认值（与聚宽保持一致）
+    #     处理 end_date 的默认值（与聚宽保持一致）
     # 聚宽官方：如果没有提供 end_date，默认是 datetime.datetime(2015, 12, 31)
     # 但如果提供了 count，end_date 应该默认为 current_dt（从当前时间往前推）
     if end_date is None:
@@ -1302,10 +1333,11 @@ def get_price(
         else:
             # 没有 count 时，使用聚宽的默认值（过去的日期）
             end_date = datetime(2015, 12, 31)
-    elif isinstance(end_date, str):
-        end_date = pd.to_datetime(end_date)
-    elif isinstance(end_date, Date) and not isinstance(end_date, datetime):
-        end_date = datetime.combine(end_date, Time(15, 0))
+    
+    # 统一转换为 datetime（处理 str 和 date 输入）
+    end_date = _coerce_datetime(end_date)
+    if end_date is None:
+        end_date = current_dt
     
     # 标准化频率
     frequency_map = {'daily': '1d', 'minute': '1m'}
@@ -1336,7 +1368,8 @@ def get_price(
                 _check_intraday_future_data(current_dt, fields, end_date)
     
     # 限制 end_date 不超过当前时间
-    end_date = min(end_date, current_dt)
+    if end_date > current_dt:
+        end_date = current_dt
     
     # 真实价格模式：使用当前回测时间作为复权参考日期
     # 注意：当 panel=False 时跳过真实价格模式，因为 get_price_engine 不支持 panel 参数
@@ -1580,7 +1613,7 @@ def _raise_if_empty_minute_data(
     if not isinstance(result, pd.DataFrame) or not result.empty:
         return
     try:
-        trade_days = _provider.get_trade_days(end_date=end_date.date(), count=1)
+        trade_days = _provider.get_trade_days(end_date=end_date, count=1)
     except Exception:
         trade_days = []
     if not trade_days:
@@ -1611,7 +1644,7 @@ def attribute_history(
     skip_paused: bool = False,
     df: bool = True,
     fq: str = 'pre'
-) -> Union[pd.DataFrame, Dict]:
+) -> Union[pd.DataFrame, Dict[str, Any]]:
     """
     获取单个标的历史数据（避免未来函数，支持真实价格）。
 
@@ -1630,7 +1663,7 @@ def attribute_history(
     if not _current_context:
         end_date = datetime.now()
     else:
-        end_date = _current_context.current_dt
+        end_date = cast(datetime, _current_context.current_dt)
 
     # 对齐聚宽语义：日线不含当天，分钟线包含当前分钟
     if 'm' in unit:
@@ -1705,10 +1738,10 @@ def get_bars(
     security: Union[str, List[str]],
     count: int,
     unit: str = '1d',
-    fields: Union[List[str], tuple] = ('date', 'open', 'high', 'low', 'close'),
+    fields: Union[List[str], Tuple[str, ...]] = ('date', 'open', 'high', 'low', 'close'),
     include_now: bool = False,
     end_dt: Optional[Union[str, datetime]] = None,
-    fq_ref_date: Union[int, datetime, Date, None] = 1,
+    fq_ref_date: Union[int, datetime] = 1,
     df: bool = False,
 ) -> Any:
     """
@@ -1721,11 +1754,17 @@ def get_bars(
     resolved_end = _ensure_not_future_dt(resolved_end, "get_bars.end_dt")
 
     if fq_ref_date == 1:
-        fq_ref_date = _current_context.current_dt.date() if _current_context else Date.today()
-    elif isinstance(fq_ref_date, datetime):
-        fq_ref_date = fq_ref_date.date()
-    elif fq_ref_date is not None and not isinstance(fq_ref_date, Date):
-        raise UserError("fq_ref_date 必须为 None 或 datetime.date 类型")
+        ctx_dt = _current_context.current_dt if _current_context else datetime.now()
+        fq_ref_date = ctx_dt  # datetime
+    elif isinstance(fq_ref_date, Date) and not isinstance(fq_ref_date, datetime):
+        # Convert date to datetime at midnight
+        fq_ref_date = datetime.combine(fq_ref_date, Time.min)
+
+    if fq_ref_date is None:
+        fq_ref_date = 1  # default
+
+    if not isinstance(fq_ref_date, (int, datetime)):
+        raise UserError("fq_ref_date 必须为 int 或 datetime 类型")
 
     try:
         return _provider.get_bars(
@@ -1778,6 +1817,8 @@ def get_ticks(
     if resolved_end is None:
         raise UserError("get_ticks 需要提供 end_dt 或在回测上下文中调用")
     resolved_end = _ensure_not_future_dt(resolved_end, "get_ticks.end_dt")
+    # _ensure_not_future_dt returns the same datetime when not None; cast for type checker
+    resolved_end = cast(datetime, resolved_end)
     resolved_start = _resolve_context_dt(start_dt, default_to_context=False)
     if resolved_start is None and count is None:
         count = 1
@@ -1893,12 +1934,13 @@ def get_extras(
     resolved_end = _ensure_not_future_date(resolved_end, "get_extras.end_date")
 
     if _should_avoid_future() and resolved_end and _current_context:
-        current_date = _current_context.current_dt.date()
+        ctx_dt = cast(datetime, _current_context.current_dt)
+        current_date = ctx_dt.date()
         if resolved_end == current_date and info != 'is_st':
-            if _current_context.current_dt.time() < Time(15, 0):
+            if ctx_dt.time() < Time(15, 0):
                 raise FutureDataError(
                     f"avoid_future_data=True时，回测中get_extras只能在收盘后才能取{info}数据，"
-                    f"current_dt={_current_context.current_dt}"
+                    f"current_dt={ctx_dt}"
                 )
 
     if resolved_start is None and count is None:
@@ -1910,8 +1952,8 @@ def get_extras(
         return _provider.get_extras(
             info,
             security_list,
-            start_date=resolved_start,
-            end_date=resolved_end,
+            start_date=_coerce_datetime(resolved_start),
+            end_date=_coerce_datetime(resolved_end),
             df=df,
             count=count,
         )
@@ -1938,7 +1980,8 @@ def get_fundamentals(
 
     if date is None and statDate is None:
         if _current_context:
-            resolved_date = _current_context.current_dt.date() - timedelta(days=1)
+            ctx_dt = cast(datetime, _current_context.current_dt)
+            resolved_date = ctx_dt.date() - timedelta(days=1)
         else:
             resolved_date = Date.today() - timedelta(days=1)
     else:
@@ -1951,13 +1994,15 @@ def get_fundamentals(
 
     resolved_date = _ensure_not_future_date(resolved_date, "get_fundamentals.date")
     if _should_avoid_future() and resolved_date and _current_context:
-        if resolved_date == _current_context.current_dt.date() and _query_mentions_valuation(query_object):
-            if _current_context.current_dt.time() < Time(15, 0):
+        ctx_dt = cast(datetime, _current_context.current_dt)
+        current_date = ctx_dt.date()
+        if resolved_date == current_date and _query_mentions_valuation(query_object):
+            if ctx_dt.time() < Time(15, 0):
                 raise FutureDataError(
                     "avoid_future_data=True时，回测中get_fundamentals取估值表数据需在15:00之后"
                 )
     try:
-        return _provider.get_fundamentals(query_object, date=resolved_date, statDate=statDate)
+        return _provider.get_fundamentals(query_object, date=_coerce_datetime(resolved_date), statDate=statDate)
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取财务数据失败: {e}")
@@ -1976,25 +2021,28 @@ def get_fundamentals_continuously(
     _ensure_auth()
     if end_date is None:
         if _current_context:
-            end_date = _current_context.current_dt.date() - timedelta(days=1)
+            ctx_dt = cast(datetime, _current_context.current_dt)
+            end_date = ctx_dt - timedelta(days=1)  # datetime
         else:
-            end_date = Date.today() - timedelta(days=1)
+            # Convert date to datetime at midnight
+            end_date = datetime.combine(Date.today() - timedelta(days=1), Time.min)
     resolved_end = _resolve_context_date(end_date, default_to_context=False)
     resolved_end = _ensure_not_future_date(resolved_end, "get_fundamentals_continuously.end_date")
     if _should_avoid_future() and resolved_end and _current_context:
-        if resolved_end == _current_context.current_dt.date() and _query_mentions_valuation(query_object):
-            if _current_context.current_dt.time() < Time(15, 0):
+        ctx_dt = cast(datetime, _current_context.current_dt)
+        if resolved_end == ctx_dt.date() and _query_mentions_valuation(query_object):
+            if ctx_dt.time() < Time(15, 0):
                 raise FutureDataError(
                     "avoid_future_data=True时，回测中get_fundamentals_continuously取估值表数据需在15:00之后"
                 )
     try:
         return _provider.get_fundamentals_continuously(
-            query_object, end_date=resolved_end, count=count, panel=panel
+            query_object, end_date=_coerce_datetime(resolved_end), count=count, panel=panel
         )
     except Exception as e:
         _raise_if_not_implemented(e)
         if _is_sql_unsupported(e):
-            return _fallback_fundamentals_continuously(query_object, resolved_end, count, panel)
+            return _fallback_fundamentals_continuously(query_object, _coerce_datetime(resolved_end), count, panel)
         _raise_permission_error(e, "get_fundamentals_continuously")
         log.error(f"获取连续财务数据失败: {e}")
         return pd.DataFrame()
@@ -2006,7 +2054,7 @@ def _fallback_fundamentals_continuously(
     count: int,
     panel: bool,
 ) -> pd.DataFrame:
-    trade_days = get_trade_days(end_date=end_date, count=count)
+    trade_days = get_trade_days(end_date=_coerce_datetime(end_date), count=count)
     if not trade_days:
         return pd.DataFrame()
 
@@ -2014,7 +2062,7 @@ def _fallback_fundamentals_continuously(
     for day in trade_days:
         day_date = pd.to_datetime(day).date()
         try:
-            df = _provider.get_fundamentals(query_object, date=day_date, statDate=None)
+            df = _provider.get_fundamentals(query_object, date=_coerce_datetime(day_date), statDate=None)
         except Exception as exc:
             _raise_if_not_implemented(exc)
             _raise_permission_error(exc, "get_fundamentals")
@@ -2059,7 +2107,7 @@ def get_index_weights(index_id: str, date: Optional[Union[str, datetime]] = None
     resolved_date = _ensure_not_future_date(resolved_date, "get_index_weights.date")
     _ensure_history_view("get_index_weights", resolved_date)
     try:
-        return _provider.get_index_weights(index_id, date=resolved_date)
+        return _provider.get_index_weights(index_id, date=_coerce_datetime(resolved_date))
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取指数权重失败: {e}")
@@ -2075,7 +2123,7 @@ def get_industry_stocks(industry_code: str, date: Optional[Union[str, datetime]]
     resolved_date = _ensure_not_future_date(resolved_date, "get_industry_stocks.date")
     _ensure_history_view("get_industry_stocks", resolved_date)
     try:
-        return _provider.get_industry_stocks(industry_code, date=resolved_date)
+        return _provider.get_industry_stocks(industry_code, date=_coerce_datetime(resolved_date))
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取行业成分股失败: {e}")
@@ -2091,7 +2139,7 @@ def get_industry(security: Union[str, List[str]], date: Optional[Union[str, date
     resolved_date = _ensure_not_future_date(resolved_date, "get_industry.date")
     _ensure_history_view("get_industry", resolved_date)
     try:
-        return _provider.get_industry(security, date=resolved_date)
+        return _provider.get_industry(security, date=_coerce_datetime(resolved_date))
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取行业信息失败: {e}")
@@ -2107,7 +2155,7 @@ def get_concept_stocks(concept_code: str, date: Optional[Union[str, datetime]] =
     resolved_date = _ensure_not_future_date(resolved_date, "get_concept_stocks.date")
     _ensure_history_view("get_concept_stocks", resolved_date)
     try:
-        return _provider.get_concept_stocks(concept_code, date=resolved_date)
+        return _provider.get_concept_stocks(concept_code, date=_coerce_datetime(resolved_date))
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取概念成分股失败: {e}")
@@ -2123,7 +2171,7 @@ def get_concept(security: Union[str, List[str]], date: Optional[Union[str, datet
     resolved_date = _ensure_not_future_date(resolved_date, "get_concept.date")
     _ensure_history_view("get_concept", resolved_date)
     try:
-        return _provider.get_concept(security, date=resolved_date)
+        return _provider.get_concept(security, date=_coerce_datetime(resolved_date))
     except Exception as e:
         _raise_if_not_implemented(e)
         _raise_permission_error(e, "get_concept")
@@ -2139,7 +2187,7 @@ def get_fund_info(security: str, date: Optional[Union[str, datetime]] = None) ->
     resolved_date = _resolve_context_date(date, default_to_context=True)
     resolved_date = _ensure_not_future_date(resolved_date, "get_fund_info.date")
     try:
-        return _provider.get_fund_info(security, date=resolved_date)
+        return _provider.get_fund_info(security, date=_coerce_datetime(resolved_date))
     except Exception as e:
         _raise_if_not_implemented(e)
         _raise_permission_error(e, "get_fund_info")
@@ -2156,7 +2204,7 @@ def get_margincash_stocks(date: Optional[Union[str, datetime]] = None) -> Any:
     resolved_date = _ensure_not_future_date(resolved_date, "get_margincash_stocks.date")
     _ensure_history_view("get_margincash_stocks", resolved_date)
     try:
-        return _provider.get_margincash_stocks(resolved_date)
+        return _provider.get_margincash_stocks(_coerce_datetime(resolved_date))
     except Exception as e:
         _raise_if_not_implemented(e)
         _raise_permission_error(e, "get_margincash_stocks")
@@ -2173,7 +2221,7 @@ def get_marginsec_stocks(date: Optional[Union[str, datetime]] = None) -> Any:
     resolved_date = _ensure_not_future_date(resolved_date, "get_marginsec_stocks.date")
     _ensure_history_view("get_marginsec_stocks", resolved_date)
     try:
-        return _provider.get_marginsec_stocks(resolved_date)
+        return _provider.get_marginsec_stocks(_coerce_datetime(resolved_date))
     except Exception as e:
         _raise_if_not_implemented(e)
         _raise_permission_error(e, "get_marginsec_stocks")
@@ -2189,7 +2237,7 @@ def get_dominant_future(underlying_symbol: str, date: Optional[Union[str, dateti
     resolved_date = _resolve_context_date(date, default_to_context=True)
     resolved_date = _ensure_not_future_date(resolved_date, "get_dominant_future.date")
     try:
-        return _provider.get_dominant_future(underlying_symbol, resolved_date)
+        return _provider.get_dominant_future(underlying_symbol, _coerce_datetime(resolved_date))
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取主力合约失败: {e}")
@@ -2204,7 +2252,7 @@ def get_future_contracts(underlying_symbol: str, date: Optional[Union[str, datet
     resolved_date = _resolve_context_date(date, default_to_context=True)
     resolved_date = _ensure_not_future_date(resolved_date, "get_future_contracts.date")
     try:
-        return _provider.get_future_contracts(underlying_symbol, resolved_date)
+        return _provider.get_future_contracts(underlying_symbol, _coerce_datetime(resolved_date))
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取期货合约失败: {e}")
@@ -2222,20 +2270,22 @@ def get_billboard_list(
     """
     _ensure_auth()
     if end_date is None and _current_context:
-        end_date = _current_context.current_dt.date() - timedelta(days=1)
+        ctx_dt = cast(datetime, _current_context.current_dt)
+        end_date = ctx_dt - timedelta(days=1)  # datetime
     resolved_start = _resolve_context_date(start_date, default_to_context=False)
     resolved_end = _resolve_context_date(end_date, default_to_context=True)
     resolved_end = _ensure_not_future_date(resolved_end, "get_billboard_list.end_date")
     if _should_avoid_future() and resolved_end and _current_context:
-        if resolved_end == _current_context.current_dt.date() and _current_context.current_dt.time() < Time(15, 0):
+        ctx_dt = cast(datetime, _current_context.current_dt)
+        if resolved_end == ctx_dt.date() and ctx_dt.time() < Time(15, 0):
             raise FutureDataError(
                 "avoid_future_data=True时，回测中get_billboard_list只能在收盘后获取当日数据"
             )
     try:
         return _provider.get_billboard_list(
             stock_list=stock_list,
-            start_date=resolved_start,
-            end_date=resolved_end,
+            start_date=_coerce_datetime(resolved_start),
+            end_date=_coerce_datetime(resolved_end),
             count=count,
         )
     except Exception as e:
@@ -2262,8 +2312,8 @@ def get_locked_shares(
     try:
         return _provider.get_locked_shares(
             stock_list=stock_list,
-            start_date=resolved_start,
-            end_date=resolved_end,
+            start_date=_coerce_datetime(resolved_start),
+            end_date=_coerce_datetime(resolved_end),
             forward_count=forward_count,
         )
     except Exception as e:
@@ -2328,7 +2378,7 @@ def get_trade_days(
         交易日列表
     """
     if _current_context:
-        max_dt = _current_context.current_dt
+        max_dt = cast(datetime, _current_context.current_dt)
         resolved_end = _resolve_context_dt(end_date, default_to_context=True)
         if resolved_end is not None:
             if _should_avoid_future():
@@ -2339,13 +2389,13 @@ def get_trade_days(
         end_date = resolved_end
     if start_date is None and count is None:
         if end_date is None:
-            end_date = Date.today()
+            end_date = datetime.combine(Date.today(), Time.min)
         count = 1
 
     try:
         trade_days = _provider.get_trade_days(
-            start_date=start_date,
-            end_date=end_date,
+            start_date=_coerce_datetime(start_date),
+            end_date=_coerce_datetime(end_date),
             count=count
         )
         return [pd.to_datetime(d) for d in trade_days]
@@ -2374,7 +2424,7 @@ def get_all_securities(
     _ensure_history_view("get_all_securities", resolved_date)
     
     try:
-        return _provider.get_all_securities(types=types, date=resolved_date)
+        return _provider.get_all_securities(types=types, date=_coerce_datetime(resolved_date))
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取标的信息失败: {e}")
@@ -2400,7 +2450,7 @@ def get_index_stocks(
     _ensure_history_view("get_index_stocks", resolved_date)
     
     try:
-        return _provider.get_index_stocks(index_symbol, date=resolved_date)
+        return _provider.get_index_stocks(index_symbol, date=_coerce_datetime(resolved_date))
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取指数成分股失败: {e}")
@@ -2466,7 +2516,7 @@ def _infer_security_type(security: str, ref_date: Optional[Date]) -> str:
     try:
         check_date = ref_date or (_current_context.current_dt.date() if _current_context else None)
         for t in ['stock', 'etf', 'lof', 'fund', 'fja', 'fjb']:
-            df = _provider.get_all_securities(types=t, date=check_date)
+            df = _provider.get_all_securities(types=t, date=_coerce_datetime(check_date))
             if not df.empty and security in df.index:
                 return t
     except Exception:
@@ -2547,7 +2597,8 @@ def get_split_dividend(
     sd = _to_date(start_date)
     ed = _to_date(end_date)
     if _current_context:
-        cd = _current_context.current_dt.date()
+        ctx_dt = cast(datetime, _current_context.current_dt)
+        cd = ctx_dt.date()
         if ed is None or ed > cd:
             ed = cd
         if sd is None:
@@ -2557,7 +2608,7 @@ def get_split_dividend(
 
     # 直接通过当前数据提供者获取标准化事件
     try:
-        return _provider.get_split_dividend(security, start_date=sd, end_date=ed)
+        return _provider.get_split_dividend(security, start_date=_coerce_datetime(sd), end_date=_coerce_datetime(ed))
     except Exception as e:
         _raise_if_not_implemented(e)
         log.debug(f"获取分红数据失败[{security}]: {e}")

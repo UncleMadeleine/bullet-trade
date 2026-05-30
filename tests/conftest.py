@@ -14,7 +14,55 @@ Pytest 全局配置与命令行参数（tests 作用域）。
 
 from __future__ import annotations
 
+import sys
+import types
+from unittest import mock
+
 import pytest
+
+
+# ---------------------------------------------------------------------------
+# 提前 mock 掘金量化 (gm) SDK，让 bullet_trade 可在任意平台导入
+# ---------------------------------------------------------------------------
+_gm = types.ModuleType("gm")
+_gm.api = types.ModuleType("gm.api")
+
+_gm.ADJUST_PREV = "PREV"
+_gm.ADJUST_POST = "POST"
+_gm.ADJUST_NONE = "NONE"
+
+_gm.SEC_TYPE_STOCK = "stock"
+_gm.SEC_TYPE_FUND = "fund"
+_gm.SEC_TYPE_INDEX = "index"
+
+_gm.set_token = mock.MagicMock()
+_gm.set_endpoint = mock.MagicMock()
+_gm.history = mock.MagicMock()
+_gm.history_n = mock.MagicMock()
+_gm.current = mock.MagicMock()
+_gm.get_trading_calendar = mock.MagicMock()
+_gm.get_symbol_infos = mock.MagicMock()
+_gm.stk_get_index_constituents = mock.MagicMock()
+_gm.stk_get_dividend = mock.MagicMock()
+
+_gm.api.ADJUST_PREV = _gm.ADJUST_PREV
+_gm.api.ADJUST_POST = _gm.ADJUST_POST
+_gm.api.ADJUST_NONE = _gm.ADJUST_NONE
+_gm.api.SEC_TYPE_STOCK = _gm.SEC_TYPE_STOCK
+_gm.api.SEC_TYPE_FUND = _gm.SEC_TYPE_FUND
+_gm.api.SEC_TYPE_INDEX = _gm.SEC_TYPE_INDEX
+_gm.api.set_token = _gm.set_token
+_gm.api.set_endpoint = _gm.set_endpoint
+_gm.api.history = _gm.history
+_gm.api.history_n = _gm.history_n
+_gm.api.current = _gm.current
+_gm.api.get_trading_calendar = _gm.get_trading_calendar
+_gm.api.get_symbol_infos = _gm.get_symbol_infos
+_gm.api.stk_get_index_constituents = _gm.stk_get_index_constituents
+_gm.api.stk_get_dividend = _gm.stk_get_dividend
+
+sys.modules.setdefault("gm", _gm)
+sys.modules.setdefault("gm.api", _gm.api)
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:

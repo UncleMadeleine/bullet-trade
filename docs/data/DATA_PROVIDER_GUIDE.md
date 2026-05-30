@@ -52,36 +52,36 @@
 回测说明：
 - 若数据源不支持历史视角，回测中会抛 `UserError`，避免误用“最新数据”参与回测。
 
-| API | JQData | MiniQMT | RemoteQMT | Tushare |
-| --- | --- | --- | --- | --- |
-| get_price | ✅H | ✅H | ✅H | ✅H |
-| history | ✅H | ✅H | ✅H | ✅H |
-| attribute_history | ✅H | ✅H | ✅H | ✅H |
-| get_bars | ✅H | — | — | — |
-| get_ticks | ✅H | — | — | — |
-| get_current_tick | ✅ | ✅ | ✅ | — |
-| get_current_data | ✅ | ✅ | ✅ | ✅ |
-| get_extras | ✅H | — | — | — |
-| get_fundamentals | ✅H | — | — | — |
-| get_fundamentals_continuously | ✅H | — | — | — |
-| get_all_securities | ✅H | ✅ | ✅ | ✅H |
-| get_security_info | ✅H | ✅ | ✅ | ✅H |
-| get_fund_info | ✅H | — | — | — |
-| get_trade_days | ✅H | ✅H | ✅H | ✅H |
-| get_trade_day | ✅H | ✅H | ✅H | ✅H |
-| get_index_stocks | ✅H | ✅H | ✅H | ✅H |
-| get_index_weights | ✅H | — | — | ✅H |
-| get_industry_stocks | ✅H | — | — | — |
-| get_industry | ✅H | — | — | — |
-| get_concept_stocks | ✅H | — | — | — |
-| get_concept | ✅H | — | — | — |
-| get_margincash_stocks | ✅H | — | — | — |
-| get_marginsec_stocks | ✅H | — | — | — |
-| get_dominant_future | ✅H | — | — | — |
-| get_future_contracts | ✅H | — | — | — |
-| get_billboard_list | ✅H | — | — | — |
-| get_locked_shares | ✅H | — | — | — |
-| get_split_dividend | ✅H | ✅H | ✅H | ✅H |
+| API | JQData | MiniQMT | RemoteQMT | Tushare | MysQuant |
+| --- | --- | --- | --- | --- | --- |
+| get_price | ✅H | ✅H | ✅H | ✅H | ✅H |
+| history | ✅H | ✅H | ✅H | ✅H | ✅H |
+| attribute_history | ✅H | ✅H | ✅H | ✅H | ✅H |
+| get_bars | ✅H | — | — | — | — |
+| get_ticks | ✅H | — | — | — | — |
+| get_current_tick | ✅ | ✅ | ✅ | — | ✅ |
+| get_current_data | ✅ | ✅ | ✅ | ✅ | ✅ |
+| get_extras | ✅H | — | — | — | — |
+| get_fundamentals | ✅H | — | — | — | — |
+| get_fundamentals_continuously | ✅H | — | — | — | — |
+| get_all_securities | ✅H | ✅ | ✅ | ✅H | ✅H |
+| get_security_info | ✅H | ✅ | ✅ | ✅H | ✅H |
+| get_fund_info | ✅H | — | — | — | — |
+| get_trade_days | ✅H | ✅H | ✅H | ✅H | ✅H |
+| get_trade_day | ✅H | ✅H | ✅H | ✅H | ✅H |
+| get_index_stocks | ✅H | ✅H | ✅H | ✅H | ✅H |
+| get_index_weights | ✅H | — | — | ✅H | — |
+| get_industry_stocks | ✅H | — | — | — | — |
+| get_industry | ✅H | — | — | — | — |
+| get_concept_stocks | ✅H | — | — | — | — |
+| get_concept | ✅H | — | — | — | — |
+| get_margincash_stocks | ✅H | — | — | — | — |
+| get_marginsec_stocks | ✅H | — | — | — | — |
+| get_dominant_future | ✅H | — | — | — | — |
+| get_future_contracts | ✅H | — | — | — | — |
+| get_billboard_list | ✅H | — | — | — | — |
+| get_locked_shares | ✅H | — | — | — | — |
+| get_split_dividend | ✅H | ✅H | ✅H | ✅H | ✅H |
 
 补充说明：
 - MiniQMT/RemoteQMT 的指数成分历史视角依赖 xtquant/远端服务端实现，若接口返回为空或报错请以实际能力为准。
@@ -258,4 +258,5 @@ QMT_DATA_PATH=C:\国金QMT交易端模拟\userdata_mini
 - [聚宽数据](DATA_PROVIDER_JQDATA.md)
 - [MiniQMT 数据](DATA_PROVIDER_MINIQMT.md)
 - [Tushare 数据](DATA_PROVIDER_TUSHARE.md)
+- [掘金量化数据](DATA_PROVIDER_MYSQUANT.md)
 - [按名称直接访问数据提供者](DATA_PROVIDER_DIRECT_ACCESS.md)
