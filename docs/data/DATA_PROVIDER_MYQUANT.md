@@ -1,13 +1,12 @@
 # 掘金量化 (MyQuant) 数据源封装说明
 
-`MysQuantProvider` 位于 `bullet_trade/data/providers/mysquant.py`，通过 `DEFAULT_DATA_PROVIDER=mysquant` 或 `set_data_provider('mysquant', token='xxx')` 激活。
+`MysQuantProvider` 位于 `bullet_trade/data/providers/myquant.py`，通过 `DEFAULT_DATA_PROVIDER=myquant` 或 `set_data_provider('myquant', token='xxx')` 激活。
 
 ## 安装与认证
 
-- 依赖 `gm-sdk`（掘金量化 Python SDK），建议通过 `pip install bullet-trade[mysquant]` 一键安装。
-- 认证方式：使用 `MYSQUANT_TOKEN` 环境变量或在 `set_data_provider` 中传入 `token` 参数。
-- Provider 会在首次调用时自动调用 `gm.set_token()` 完成认证。
-- 如需连接本地掘金终端（默认端口 7070），可设置 `MYSQUANT_SERVER` 和 `MYSQUANT_PORT` 环境变量。
+- 依赖 `gm`（掘金量化 Python SDK），建议通过 `pip install bullet-trade[myquant]` 一键安装。
+- 认证方式：使用 `MYQUANT_TOKEN` 环境变量或在 `set_data_provider` 中传入 `token` 参数。
+- 如需连接本地掘金终端（默认端口 7070），可设置 `MYQUANT_SERVER` 和 `MYQUANT_PORT` 环境变量。
 
 ## 代码格式
 
@@ -80,11 +79,11 @@ import os
 from bullet_trade import set_data_provider, get_price
 
 # 方式1：环境变量
-os.environ['DEFAULT_DATA_PROVIDER'] = 'mysquant'
-os.environ['MYSQUANT_TOKEN'] = 'your_token_here'
+os.environ['DEFAULT_DATA_PROVIDER'] = 'myquant'
+os.environ['MYQUANT_TOKEN'] = 'your_token_here'
 
 # 方式2：代码设置
-set_data_provider('mysquant', token='your_token_here')
+set_data_provider('myquant', token='your_token_here')
 
 # 获取行情
 df = get_price('SHSE.600000', start_date='2024-01-01', end_date='2024-12-31', frequency='daily')
@@ -95,4 +94,4 @@ print(df.head())
 
 - **认证失败**：检查 token 是否正确，终端是否登录。
 - **无数据返回**：确认标的代码格式、交易日期是否为交易日、token 权限是否足够。
-- **连接超时**：检查 `MYSQUANT_SERVER`/`MYSQUANT_PORT` 是否指向正确的终端地址。
+- **连接超时**：检查 `MYQUANT_SERVER`/`MYQUANT_PORT` 是否指向正确的终端地址。

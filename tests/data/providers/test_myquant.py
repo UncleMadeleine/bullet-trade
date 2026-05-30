@@ -4,17 +4,17 @@ from datetime import datetime, date as Date
 
 import pandas as pd
 
-from bullet_trade.data.providers.mysquant import MysQuantProvider
+from bullet_trade.data.providers.myquant import MysQuantProvider
 
 
 class TestMysQuantProviderCodeConversion:
     """Test code format conversion utilities."""
 
-    def test_to_mysquant_code(self):
-        assert MysQuantProvider._to_mysquant_code("600000.XSHG") == "SHSE.600000"
-        assert MysQuantProvider._to_mysquant_code("000001.XSHE") == "SZSE.000001"
-        assert MysQuantProvider._to_mysquant_code("600000") == "600000"
-        assert MysQuantProvider._to_mysquant_code("SHSE.600000") == "SHSE.600000"
+    def test_to_myquant_code(self):
+        assert MysQuantProvider._to_myquant_code("600000.XSHG") == "SHSE.600000"
+        assert MysQuantProvider._to_myquant_code("000001.XSHE") == "SZSE.000001"
+        assert MysQuantProvider._to_myquant_code("600000") == "600000"
+        assert MysQuantProvider._to_myquant_code("SHSE.600000") == "SHSE.600000"
 
     def test_to_jq_code(self):
         assert MysQuantProvider._to_jq_code("SHSE.600000") == "600000.XSHG"
@@ -68,14 +68,14 @@ class TestMysQuantProviderInitialization:
     def test_init_without_token_does_not_raise(self):
         # Should not raise until auth() is called
         provider = MysQuantProvider()
-        assert provider.name == "mysquant"
+        assert provider.name == "myquant"
         assert provider.requires_live_data is True
 
     def test_auth_raises_without_token(self, monkeypatch):
-        monkeypatch.delenv("MYSQUANT_TOKEN", raising=False)
         monkeypatch.delenv("MYQUANT_TOKEN", raising=False)
+        monkeypatch.delenv("MYSQUANT_TOKEN", raising=False)
         provider = MysQuantProvider()
-        with pytest.raises(RuntimeError, match="MYSQUANT_TOKEN"):
+        with pytest.raises(RuntimeError, match="MYQUANT_TOKEN"):
             provider.auth()
 
     def test_auth_with_token(self, monkeypatch):
@@ -90,8 +90,8 @@ class TestMysQuantProviderGetPrice:
     """Test get_price method."""
 
     def test_get_price_requires_auth(self, monkeypatch):
-        monkeypatch.delenv("MYSQUANT_TOKEN", raising=False)
         monkeypatch.delenv("MYQUANT_TOKEN", raising=False)
+        monkeypatch.delenv("MYSQUANT_TOKEN", raising=False)
         provider = MysQuantProvider()
         with pytest.raises(RuntimeError):
             provider.get_price("SHSE.600000")
@@ -112,7 +112,7 @@ class TestMysQuantProviderGetPrice:
         provider = MysQuantProvider(config={"token": "test"})
         provider.auth()
         provider.get_price("600000.XSHG", start_date="2024-01-01", end_date="2024-01-01")
-        # Verify history called with mysquant code
+        # Verify history called with myquant code
         call_args = mock_history.call_args
         assert call_args[1]["symbol"] == "SHSE.600000"
 
@@ -157,8 +157,8 @@ class TestMysQuantProviderTradeDays:
     """Test get_trade_days."""
 
     def test_get_trade_days_requires_auth(self, monkeypatch):
-        monkeypatch.delenv("MYSQUANT_TOKEN", raising=False)
         monkeypatch.delenv("MYQUANT_TOKEN", raising=False)
+        monkeypatch.delenv("MYSQUANT_TOKEN", raising=False)
         provider = MysQuantProvider()
         with pytest.raises(RuntimeError):
             provider.get_trade_days()
@@ -179,8 +179,8 @@ class TestMysQuantProviderAllSecurities:
     """Test get_all_securities."""
 
     def test_get_all_securities_requires_auth(self, monkeypatch):
-        monkeypatch.delenv("MYSQUANT_TOKEN", raising=False)
         monkeypatch.delenv("MYQUANT_TOKEN", raising=False)
+        monkeypatch.delenv("MYSQUANT_TOKEN", raising=False)
         provider = MysQuantProvider()
         with pytest.raises(RuntimeError):
             provider.get_all_securities()

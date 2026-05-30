@@ -10,7 +10,9 @@ import pandas as pd
 try:
     from typing import override
 except ImportError:
-    from typing_extensions import override  # type: ignore[assignment]
+    def override(method):  # type: ignore[misc]
+        """Python <3.12 fallback: no-op decorator."""
+        return method
 
 from .base import DataProvider
 from ..cache import CacheManager
@@ -18,22 +20,22 @@ from ..cache import CacheManager
 try:
     import gm.api as gm  # pyright: ignore[reportMissingImports]
 except ImportError as exc:
-    raise ImportError(
-        "未安装掘金量化 SDK，请执行 `pip install bullet-trade[mysquant]` 或 `pip install gm-sdk`"
-    ) from exc
+        raise ImportError(
+            "未安装掘金量化 SDK，请执行 `pip install bullet-trade[myquant]` 或 `pip install gm`"
+        ) from exc
 
 logger = logging.getLogger(__name__)
 
 
 class MysQuantProvider(DataProvider):
     """
-    掘金量化 (MySQant) 数据源提供者。
+    掘金量化 (MyQuant) 数据源提供者。
 
     支持历史行情、实时快照、基础信息等。
-    需要配置 MYSQUANT_TOKEN 环境变量或通过 config 传入。
+    需要配置 MYQUANT_TOKEN 环境变量或通过 config 传入。
     """
 
-    name: str = "mysquant"
+    name: str = "myquant"
     requires_live_data: bool = True
 
     # Mapping: 掘金交易所 -> JQ 后缀
@@ -47,7 +49,6 @@ class MysQuantProvider(DataProvider):
         self.config = config or {}
         self._token = (
             self.config.get("token")
-            or os.getenv("MYSQUANT_TOKEN")
             or os.getenv("MYQUANT_TOKEN")
         )
         cache_dir_set = "cache_dir" in self.config
@@ -63,7 +64,7 @@ class MysQuantProvider(DataProvider):
     # ------------------------ 公共工具 ------------------------
 
     @classmethod
-    def _to_mysquant_code(cls, security: str) -> str:
+    def _to_myquant_code(cls, security: str) -> str:
         """将代码转换为掘金格式（例如 600000.XSHG -> SHSE.600000）。幂等。"""
         if not security or "." not in security:
             return security
@@ -165,14 +166,14 @@ class MysQuantProvider(DataProvider):
         掘金量化认证。
 
         配置项：
-        - token: 通过环境变量 MYSQUANT_TOKEN 或 config['token'] 传入
+        - token: 通过环境变量 MYQUANT_TOKEN 或 config['token'] 传入
         - host/port: 可选，连接自定义终端地址
         """
         token = user or self._token
         if not token:
             raise RuntimeError(
-                "MYSQUANT_TOKEN 未配置，"
-                "请设置环境变量 MYSQUANT_TOKEN 或在 config 中传入 token"
+                "MYQUANT_TOKEN 未配置，"
+                "请设置环境变量 MYQUANT_TOKEN 或在 config 中传入 token"
             )
         gm.set_token(token)
         if host:
@@ -213,7 +214,7 @@ class MysQuantProvider(DataProvider):
         frames: Dict[str, pd.DataFrame] = {}
 
         for sec in securities:
-            mys_code = self._to_mysquant_code(sec)
+            mys_code = self._to_myquant_code(sec)
 
             def _fetch_single(kw: Dict[str, Any]) -> pd.DataFrame:
                 if kw.get("count") is not None:
@@ -324,7 +325,7 @@ class MysQuantProvider(DataProvider):
 
         # 处理证券代码
         securities = [security] if isinstance(security, str) else list(security)
-        mys_codes = [self._to_mysquant_code(s) for s in securities]
+        mys_codes = [self._to_myquant_code(s) for s in securities]
 
         # 频率映射：聚宽 → 掘金
         # 聚宽: '1d', '1m', '5m', '15m', '30m', '60m'
@@ -605,7 +606,7 @@ class MysQuantProvider(DataProvider):
     ) -> List[str]:
         self._ensure_auth()
 
-        gm_index = self._to_mysquant_code(index_symbol)
+        gm_index = self._to_myquant_code(index_symbol)
         target_date = self._to_date_str(date) if date else None
 
         kwargs = {"index": gm_index, "date": target_date}
@@ -680,7 +681,7 @@ class MysQuantProvider(DataProvider):
     ) -> List[Dict[str, Any]]:
         self._ensure_auth()
 
-        mys_code = self._to_mysquant_code(security)
+        mys_code = self._to_myquant_code(security)
         start_str = self._to_date_str(start_date)
         end_str = self._to_date_str(end_date)
 
@@ -744,7 +745,7 @@ class MysQuantProvider(DataProvider):
         df: bool = False,
     ) -> Any:
         self._ensure_auth()
-        mys_code = self._to_mysquant_code(security)
+        mys_code = self._to_myquant_code(security)
 
         try:
             gm_module = self._ensure_sdk()

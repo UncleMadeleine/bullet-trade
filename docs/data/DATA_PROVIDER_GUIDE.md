@@ -258,5 +258,5 @@ QMT_DATA_PATH=C:\国金QMT交易端模拟\userdata_mini
 - [聚宽数据](DATA_PROVIDER_JQDATA.md)
 - [MiniQMT 数据](DATA_PROVIDER_MINIQMT.md)
 - [Tushare 数据](DATA_PROVIDER_TUSHARE.md)
-- [掘金量化数据](DATA_PROVIDER_MYSQUANT.md)
+- [掘金量化数据](DATA_PROVIDER_MYQUANT.md)
 - [按名称直接访问数据提供者](DATA_PROVIDER_DIRECT_ACCESS.md)

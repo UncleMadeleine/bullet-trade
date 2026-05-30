@@ -48,8 +48,8 @@ def _normalize_provider_name(name: Optional[str]) -> str:
         return "miniqmt"
     if lowered in ("qmt-remote", "remote-qmt", "remote_qmt"):
         return "remote_qmt"
-    if lowered in ("mysquant", "myquant", "gm"):
-        return "mysquant"
+    if lowered in ("myquant", "gm"):
+        return "myquant"
     return lowered
 
 
@@ -71,9 +71,9 @@ def _create_provider(provider_name: Optional[str] = None, overrides: Optional[Di
         provider_cfg = dict(config.get('tushare', {}) or {})
         provider_cfg.update(overrides)
         return TushareProvider(provider_cfg)
-    if target in ('mysquant',):
-        from .providers.mysquant import MysQuantProvider
-        provider_cfg = dict(config.get('mysquant', {}) or {})
+    if target in ('myquant',):
+        from .providers.myquant import MysQuantProvider
+        provider_cfg = dict(config.get('myquant', {}) or {})
         provider_cfg.update(overrides)
         return MysQuantProvider(provider_cfg)
     if target in ('qmt', 'miniqmt'):
@@ -178,7 +178,7 @@ def _sdk_fallback_targets(provider_name: str, provider: DataProvider, method_nam
             target = getattr(mod, method_name, None)
             if target:
                 return target
-    elif normalized == "mysquant":
+    elif normalized == "myquant":
         mod = _lazy_import("gm.api")
         if mod:
             target = getattr(mod, method_name, None)

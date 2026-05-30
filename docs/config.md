@@ -8,7 +8,7 @@
 | 变量 | 必填 | 示例/默认 | 作用 |
 | --- | --- | --- | --- |
 | `BT_ENV_FILE`/`BULLET_TRADE_ENV_FILE`/`ENV_FILE` | 否 | `./.env.live` | 指定要加载的 `.env` 路径，覆盖默认的向上查找逻辑 |
-| `DEFAULT_DATA_PROVIDER` | 否 | `jqdata` | 默认行情源，回测/实盘共用（`jqdata`/`tushare`/`mysquant`/`qmt`） |
+| `DEFAULT_DATA_PROVIDER` | 否 | `jqdata` | 默认行情源，回测/实盘共用（`jqdata`/`tushare`/`myquant`/`qmt`） |
 | `DEFAULT_BROKER` | 否 | `qmt` | 默认券商/交易通道（`simulator`/`qmt`/`qmt-remote`） |
 | `DATA_CACHE_DIR` | 否 | `~/.bullet-trade/cache` | 行情缓存根目录，子目录按数据源名自动创建；留空禁用缓存 |
 | `LOG_DIR` | 否 | `logs` | 日志目录 |
@@ -24,9 +24,9 @@
 | `JQDATA_SERVER`/`JQDATA_PORT` | 否 | `srv`/`8087` | 聚宽网关的地址/端口，不填则使用官方默认 |
 | `TUSHARE_TOKEN` | 选 | `your_token` | 需 `tushare` 时配置 |
 | `TUSHARE_CUSTOM_URL` | 否 | `http://127.0.0.1:port` | Tushare 自定义接入点 |
-| `MYSQUANT_TOKEN` | 选 | `your_token` | 掘金量化 token，需在掘金平台申请 |
-| `MYSQUANT_SERVER` | 否 | `localhost` | 自定义掘金终端地址（如本地运行终端） |
-| `MYSQUANT_PORT` | 否 | `7070` | 自定义掘金终端端口 |
+| `MYQUANT_TOKEN` | 选 | `your_token` | 掘金量化 token，需在掘金平台申请 |
+| `MYQUANT_SERVER` | 否 | `localhost` | 自定义掘金终端地址（如本地运行终端） |
+| `MYQUANT_PORT` | 否 | `7070` | 自定义掘金终端端口 |
 | `MINIQMT_MARKET` | 否 | `SH` | MiniQMT 行情源的市场代码（交易日/数据过滤），默认上交所 |
 
 ## 本地实盘（QMT/模拟）
