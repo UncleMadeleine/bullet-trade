@@ -150,7 +150,7 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | 变量 | 默认/示例 | 作用 |
 | --- | --- | --- |
 | `BT_ENV_FILE` / `BULLET_TRADE_ENV_FILE` / `ENV_FILE` | `./.env.live` | 显式指定要加载的 `.env` 文件；优先于自动向上查找 `.env`。 |
-| `DEFAULT_DATA_PROVIDER` | `jqdata` | 默认行情源：`jqdata`、`tushare`、`myquant`、`qmt`、`qmt-remote`、`rqdata`、`easy_tdx`。RQData/easy_tdx 仍为 Beta，需要显式启用。 |
+| `DEFAULT_DATA_PROVIDER` | `jqdata` | 默认行情源：`jqdata`、`tushare`、`myquant`、`akshare`、`qmt`、`qmt-remote`、`rqdata`、`easy_tdx`。RQData/easy_tdx/AKShare 仍为 Beta，需要显式启用。 |
 | `DEFAULT_BROKER` | `simulator` | 默认券商/交易通道：`simulator`、`qmt`、`qmt-remote`、`huaxin`；远程华鑫策略通常仍选择 `qmt-remote`，由 server 使用 `huaxin` adapter。 |
 | `LOG_DIR` | `./logs` | 日志目录。 |
 | `LOG_LEVEL` | `INFO` | 控制台日志级别。 |
@@ -178,6 +178,7 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | `MYQUANT_TOKEN` | 空 | 掘金量化 token，需在掘金平台申请；也可用 `gm` 作为 provider 别名。 |
 | `MYQUANT_SERVER` | `localhost` | 自定义掘金终端地址（如本地运行终端）。 |
 | `MYQUANT_PORT` | `7070` | 自定义掘金终端端口。 |
+| `AKSHARE` 专用变量 | 无需配置 | AKShare 免费数据源无需账号或 token；可通过 `DATA_CACHE_DIR` 控制缓存。 |
 | `RQDATA_LICENSE` | 空 | RQData license；配置后优先使用 license 初始化 `rqdatac`。 |
 | `RQDATA_USERNAME` / `RQDATA_PASSWORD` | 空 | RQData 用户名和密码；未配置 license 时使用。 |
 | `RQDATA_USER` / `RQDATA_PWD` | 空 | RQData 账号密码旧别名，仍兼容。 |

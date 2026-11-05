@@ -38,6 +38,7 @@ nav:
           - Tushare 数据: data/DATA_PROVIDER_TUSHARE.md
           - RQData 数据 Beta: data/DATA_PROVIDER_RQDATA.md
           - easy_tdx 通达信数据 Beta: data/DATA_PROVIDER_EASY_TDX.md
+          - AKShare 数据 Beta: data/DATA_PROVIDER_AKSHARE.md
   - 高级接入与贡献:
       - MiniQMT（兼容方案）: data/DATA_PROVIDER_MINIQMT.md
       - 华鑫 TORA（自备 SDK）: huaxin.md

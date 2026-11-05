@@ -73,6 +73,9 @@ rqdata = [
 tdx = [
     "easy-tdx>=0.1.0; python_version >= '3.10'",
 ]
+akshare = [
+    "akshare>=1.20.0",
+]
 report = [
     "snapshot-selenium>=0.0.3",
     "selenium>=4.10.0",

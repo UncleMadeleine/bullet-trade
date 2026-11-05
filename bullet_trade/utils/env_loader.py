@@ -202,6 +202,9 @@ def get_data_provider_config() -> dict:
             "use_stub": get_env_bool("EASY_TDX_USE_STUB", False),
             "cache_dir": cache_dir_for("easy_tdx"),
         },
+        "akshare": {
+            "cache_dir": cache_dir_for("akshare"),
+        },
     }
 
 

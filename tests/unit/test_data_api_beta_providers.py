@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 import bullet_trade.data.api as data_api
+from bullet_trade.data.providers.akshare import AkshareProvider
 from bullet_trade.data.providers.easy_tdx import EasyTdxProvider
 from bullet_trade.data.providers.rqdata import RQDataProvider
 
@@ -16,6 +17,8 @@ def test_provider_name_aliases_are_normalized() -> None:
     assert data_api._normalize_provider_name("ricequant") == "rqdata"
     assert data_api._normalize_provider_name("tdx") == "easy_tdx"
     assert data_api._normalize_provider_name("easy-tdx") == "easy_tdx"
+    assert data_api._normalize_provider_name("akshare") == "akshare"
+    assert data_api._normalize_provider_name("ak") == "akshare"
 
 
 @pytest.mark.unit
@@ -35,3 +38,12 @@ def test_create_easy_tdx_provider_without_connecting() -> None:
     assert isinstance(provider, EasyTdxProvider)
     assert provider.name == "easy_tdx"
     assert provider._connected is False
+
+
+@pytest.mark.unit
+def test_create_akshare_provider_without_importing_sdk() -> None:
+    """创建 AkshareProvider 不应立刻导入真实 akshare。"""
+    provider = data_api._create_provider("ak", overrides={"akshare": object()})
+
+    assert isinstance(provider, AkshareProvider)
+    assert provider.name == "akshare"

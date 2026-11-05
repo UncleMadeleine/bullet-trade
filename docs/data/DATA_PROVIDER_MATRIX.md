@@ -12,6 +12,7 @@
 | Tushare | `bullet-trade[tushare]` | Tushare token | macOS/Linux/Windows | 股票、指数、基金，依积分权限 | 非主力实时源 | 支持未复权、前/后复权；动态锚定依因子 | 已有补充数据源 |
 | RQData | `bullet-trade[rqdata]` | RQData license 或账号 | macOS/Linux/Windows | 理论支持股票/基金/指数，待真实账号验收 | `get_live_current` mock 已覆盖，真实待验收 | 实现未复权 + factor + `pre_factor_ref_date` 手工锚定 | Beta，mock 已覆盖，真实账号待验证 |
 | easy_tdx | `bullet-trade[tdx]` | Python 3.10+、网络可连通达信行情服务器 | macOS/Linux/Windows online；离线文件另议 | 实测样例日线到 1991-04-03，1m 到 2026-01-19，5m 到 2024-05-29；以服务器返回为准 | 支持 quote 轮询快照 | 未复权 + TDX 除权除息事件构造 factor，支持日线 `pre_factor_ref_date` 动态前复权；分钟线受历史深度限制 | Beta，本机 online 与 JQData 已做样例对账 |
+| AKShare | `bullet-trade[akshare]` | 无需账号；依赖公开网页接口 | macOS/Linux/Windows | 股票/指数/ETF/LOF 日线较完整；分钟线历史较短 | 支持轮询式实时快照 | 支持 qfq/hfq，但不支持按 `pre_factor_ref_date` 动态锚定 | Beta，适合免费探索和轻量回测 |
 
 ## 选型建议
 
@@ -19,6 +20,7 @@
 - 需要与 QMT 实盘尽量一致时，优先 MiniQMT 或 RemoteQMT。
 - MiniQMT 是本地 xtquant/`userdata_mini` 直连；RemoteQMT 可以由 MiniQMT server 提供，也可以由大 QMT helper + `--server-type big_qmt` 提供。大 QMT 启动流程见 [大 QMT 服务向导](../big-qmt-server.md)。
 - easy_tdx 适合作为免费行情源探索和轻量 smoke；日线动态前复权已有样例对账，分钟级长期历史回测仍受免费 online 分钟线保留窗口限制。
+- AKShare 适合快速体验、教学和免费探索；它只能返回当前证券列表与指数成分，分钟历史较短，不建议用于需要严格历史时点或长周期分钟回测的生产策略。
 - RQData 在拿到 API key 并完成真实对账前，只作为 Beta provider 接入和测试。
 
 ## 发布验收要求

@@ -59,6 +59,8 @@ def _normalize_provider_name(name: Optional[str]) -> str:
         return "remote_qmt"
     if lowered in ("myquant", "gm"):
         return "myquant"
+    if lowered in ("akshare", "ak"):
+        return "akshare"
     if lowered in ("rqdata", "rqdatac", "ricequant"):
         return "rqdata"
     if lowered in ("tdx", "easytdx", "easy_tdx", "easy-tdx"):
@@ -94,6 +96,12 @@ def _create_provider(
         provider_cfg = dict(config.get("myquant", {}) or {})
         provider_cfg.update(overrides)
         return MysQuantProvider(provider_cfg)
+    if target in ("akshare",):
+        from .providers.akshare import AkshareProvider
+
+        provider_cfg = dict(config.get("akshare", {}) or {})
+        provider_cfg.update(overrides)
+        return AkshareProvider(provider_cfg)
     if target in ("qmt", "miniqmt"):
         from .providers.miniqmt import MiniQMTProvider
 

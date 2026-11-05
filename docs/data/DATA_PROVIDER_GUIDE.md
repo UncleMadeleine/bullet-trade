@@ -74,6 +74,18 @@
 - 通过通达信除权除息事件构造 `factor`，支持日线 `pre_factor_ref_date` 动态前复权；分钟线仍受免费 online 分钟历史深度限制。
 - 真实模式连接失败不会自动返回 stub 假行情；`use_stub=True` 仅用于测试/demo。
 
+### AKShare Provider Beta
+
+**优点：**
+- 完全免费，无需账号或 token，安装后即可拉取股票、指数、ETF/LOF 行情。
+- 支持日线、分钟线、交易日、当前证券列表、最新指数成分和轮询式实时快照。
+
+**当前限制：**
+- 证券列表和指数成分只能返回最新结果，不能按历史日期还原。
+- 分钟历史深度由东方财富接口决定，通常只适合短区间。
+- 不提供 tick 历史、停牌标记和涨跌停价；不支持按 `pre_factor_ref_date` 动态前复权。
+- 依赖公开网页接口，上游改版可能导致短时不可用。
+
 ## 📋 数据 API 支持矩阵
 
 标记说明：
@@ -122,6 +134,7 @@
 
 补充说明：
 - MiniQMT/RemoteQMT 的指数成分历史视角依赖 xtquant/远端服务端实现，若接口返回为空或报错请以实际能力为准。
+- AKShare Beta 支持日线/分钟 `get_price`、交易日、当前证券列表、最新指数成分、实时快照和个股分红；不支持历史时点证券列表、长周期分钟历史、tick 历史和动态前复权锚定，详见 [AKShare 数据源](DATA_PROVIDER_AKSHARE.md)。
 - RQData Beta 当前统一标为 `MOCK`：代码路径和离线合同测试已覆盖，但没有真实账号/API key，不能视为真实数据验收通过。
 - easy_tdx Beta 的 `*` 表示已按当前验收定义通过或可用，但存在明确边界：免费分钟线旧历史深度有限，证券列表不保证与 JQData 全量一致，交易日由上证指数日线推导，指数成分接口仍标为 `LIMIT`。
 
@@ -177,6 +190,16 @@ EASY_TDX_PORT=7709
 EASY_TDX_TIMEOUT=10
 EASY_TDX_USE_STUB=false
 ```
+
+### 5. AKShare 配置（Beta）
+
+```env
+DEFAULT_DATA_PROVIDER=akshare
+# 可选：开启历史行情缓存
+DATA_CACHE_DIR=~/.bullet-trade/cache
+```
+
+安装：`pip install bullet-trade[akshare]`。无需账号或 token。
 
 ## 📝 代码示例
 
@@ -235,6 +258,9 @@ set_data_provider('rqdata')
 
 # 切换到 easy_tdx Beta
 set_data_provider('easy_tdx')
+
+# 切换到 AKShare Beta（无需账号）
+set_data_provider('akshare')
 ```
 
 ## 🎯 直接访问特有接口
@@ -329,6 +355,7 @@ QMT_DATA_PATH=C:\国金QMT交易端模拟\userdata_mini
 - [大 QMT 服务向导](../big-qmt-server.md)
 - [Tushare 数据](DATA_PROVIDER_TUSHARE.md)
 - [掘金量化数据](DATA_PROVIDER_MYQUANT.md)
+- [AKShare 数据 Beta](DATA_PROVIDER_AKSHARE.md)
 - [RQData 数据 Beta](DATA_PROVIDER_RQDATA.md)
 - [easy_tdx 通达信数据 Beta](DATA_PROVIDER_EASY_TDX.md)
 - [数据源能力矩阵](DATA_PROVIDER_MATRIX.md)
