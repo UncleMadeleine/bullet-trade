@@ -15,6 +15,9 @@ class FakeAk:
 
     def __init__(self) -> None:
         self.calls = []
+        self.empty_periods: set = set()
+        self.pb_quantile_nan = False
+        self.blank_industry = False
 
     def stock_zh_a_hist(self, **kwargs) -> pd.DataFrame:
         """返回两行日线数据。"""
@@ -184,7 +187,7 @@ class FakeAk:
         )
 
     def stock_zh_a_spot_em(self) -> pd.DataFrame:
-        """返回实时股票快照。"""
+        """返回实时股票快照; 含市净率/市盈率-动态估值字段。"""
         return pd.DataFrame(
             [
                 {
@@ -197,6 +200,8 @@ class FakeAk:
                     "昨收": 10.0,
                     "成交量": 12345,
                     "成交额": 129622500.0,
+                    "市净率": 1.2,
+                    "市盈率-动态": 8.5,
                 },
                 {
                     "代码": "600000",
@@ -208,6 +213,61 @@ class FakeAk:
                     "昨收": 8.0,
                     "成交量": 1000,
                     "成交额": 8000000.0,
+                    "市净率": 0.9,
+                    "市盈率-动态": 5.4,
+                },
+                {
+                    "代码": "300750",
+                    "名称": "宁德时代",
+                    "最新价": 180.0,
+                    "今开": 178.0,
+                    "最高": 182.0,
+                    "最低": 176.0,
+                    "昨收": 179.0,
+                    "成交量": 50000,
+                    "成交额": 9000000000.0,
+                    "市净率": 3.5,
+                    "市盈率-动态": 20.1,
+                },
+            ]
+        )
+
+
+    def stock_a_all_pb(self, **kwargs) -> pd.DataFrame:
+        """返回全A中位数PB历史序列; pb_quantile_nan 为真时分位列留空。"""
+        self.calls.append(("stock_a_all_pb", kwargs))
+        quantile = [None, None, None] if self.pb_quantile_nan else [None, None, 0.425]
+        return pd.DataFrame(
+            {
+                "date": ["2024-01-31", "2024-02-29", "2024-03-31"],
+                "middlePB": [2.10, 2.30, 2.20],
+                "equalWeightAveragePB": [2.60, 2.70, 2.80],
+                "close": [3000.0, 3100.0, 3200.0],
+                "quantileInAllHistoryMiddlePB": quantile,
+            }
+        )
+
+    def stock_yjbb_em(self, **kwargs) -> pd.DataFrame:
+        """返回业绩报表; date 命中 empty_periods 时返回空表。"""
+        self.calls.append(("stock_yjbb_em", kwargs))
+        if kwargs.get("date") in self.empty_periods:
+            return pd.DataFrame()
+        industry = None if self.blank_industry else "银行Ⅱ"
+        return pd.DataFrame(
+            [
+                {
+                    "股票代码": "000001",
+                    "股票简称": "平安银行",
+                    "净资产收益率": 8.07,
+                    "营业总收入-同比增长": 2.42,
+                    "所处行业": industry,
+                },
+                {
+                    "股票代码": "600000",
+                    "股票简称": "浦发银行",
+                    "净资产收益率": 5.2,
+                    "营业总收入-同比增长": 4.42,
+                    "所处行业": industry,
                 },
             ]
         )
@@ -419,3 +479,91 @@ def test_akshare_index_price_uses_index_endpoint() -> None:
     assert not df.empty
     ak = provider._ensure_akshare()
     assert ak.calls[0][0] == "index_zh_a_hist"
+
+
+@pytest.mark.unit
+def test_akshare_pb_pe_spot_maps_codes_and_numeric_columns() -> None:
+    """全市场 PB/PE 快照应以6位代码为索引并转为数值列。"""
+    provider = _provider()
+
+    df = provider.get_pb_pe_spot()
+
+    assert list(df.columns) == ["pb", "pe"]
+    assert df.index.tolist() == ["000001", "600000", "300750"]
+    assert df.loc["000001", "pb"] == 1.2
+    assert df.loc["000001", "pe"] == 8.5
+    assert df.loc["600000", "pb"] == 0.9
+    assert pd.api.types.is_numeric_dtype(df["pb"])
+    assert pd.api.types.is_numeric_dtype(df["pe"])
+
+
+@pytest.mark.unit
+def test_akshare_market_pb_percentile_prefers_builtin_quantile() -> None:
+    """PB 分位应优先取接口自带的全历史分位。"""
+    provider = _provider()
+
+    assert provider.get_market_pb_percentile() == 42.5
+
+
+@pytest.mark.unit
+def test_akshare_market_pb_percentile_falls_back_to_series_rank() -> None:
+    """接口分位列为空时应按当前值在历史序列中的位置计算。"""
+    fake = FakeAk()
+    fake.pb_quantile_nan = True
+    provider = AkshareProvider({"akshare": fake, "cache_dir": None})
+
+    # 序列 [2.10, 2.30, 2.20] 中最新 2.20 有 2/3 的历史值不高于它
+    assert provider.get_market_pb_percentile() == 66.7
+
+
+@pytest.mark.unit
+def test_akshare_financial_snapshot_filters_codes_and_normalizes() -> None:
+    """财务快照应按代码过滤, 并输出 roe/revenue_growth/industry。"""
+    provider = _provider()
+
+    snapshot = provider.get_financial_snapshot(["000001.XSHE", "600000.XSHG"])
+
+    assert set(snapshot) == {"000001", "600000"}
+    assert snapshot["000001"]["roe"] == 8.07
+    assert snapshot["000001"]["revenue_growth"] == 2.42
+    assert snapshot["000001"]["industry"] == "银行Ⅱ"
+
+
+@pytest.mark.unit
+def test_akshare_financial_snapshot_skips_blank_industry() -> None:
+    """行业缺失时应返回空字符串而不是 None。"""
+    fake = FakeAk()
+    fake.blank_industry = True
+    provider = AkshareProvider({"akshare": fake, "cache_dir": None})
+
+    snapshot = provider.get_financial_snapshot(["000001"])
+
+    assert snapshot["000001"]["industry"] == ""
+
+
+@pytest.mark.unit
+def test_akshare_financial_snapshot_falls_back_to_earlier_period() -> None:
+    """最新报告期无数据时应逐级回退到更早的报告期。"""
+    fake = FakeAk()
+    fake.empty_periods = {"20260930"}
+    provider = AkshareProvider({"akshare": fake, "cache_dir": None})
+
+    snapshot = provider.get_financial_snapshot()
+
+    assert set(snapshot) == {"000001", "600000"}
+    used = [kwargs.get("date") for name, kwargs in fake.calls if name == "stock_yjbb_em"]
+    assert "20260930" in used
+    assert "20260630" in used
+
+
+@pytest.mark.unit
+def test_akshare_financial_snapshot_accepts_explicit_period() -> None:
+    """显式指定报告期时应只请求该报告期。"""
+    provider = _provider()
+
+    snapshot = provider.get_financial_snapshot(date="20260630")
+
+    assert set(snapshot) == {"000001", "600000"}
+    ak = provider._ensure_akshare()
+    used = [kwargs.get("date") for name, kwargs in ak.calls if name == "stock_yjbb_em"]
+    assert used == ["20260630"]

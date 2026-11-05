@@ -3,7 +3,8 @@ AKShare 数据源适配器
 
 文件职责：通过 akshare 公开接口提供聚宽兼容的免费行情数据。
 主要输入：聚宽风格证券代码、日期范围、频率、字段、复权参数。
-主要输出：聚宽兼容的 DataFrame、交易日列表、证券列表、指数成分和分红事件。
+主要输出：聚宽兼容的 DataFrame、交易日列表、证券列表、指数成分、分红事件，
+以及估值与财务快照（PB/PE、市场PB分位、ROE/营收增速/行业）。
 上下游关系：由 bullet_trade.data.api 的 provider 工厂按显式名称 akshare 创建。
 关键约定：akshare 延迟导入；该数据源属于公开网页聚合，仅作为 Beta/补充源，
 历史证券列表和指数成分只能返回最新结果，不保证回测时点准确性。
@@ -1070,3 +1071,131 @@ class AkshareProvider(DataProvider):
             "low_limit": self._to_float(tick.get("limit_down")),
             "paused": bool(tick.get("paused")),
         }
+
+    # ------------------------ 估值与财务 ------------------------
+    @staticmethod
+    def _report_periods() -> List[str]:
+        """按当前日期推断最新已披露的报告期候选（从新到旧）。
+
+        依据各报告期法定披露截止日: 三季报 10/31, 半年报 8/31, 一季报 4/30, 年报 4/30。
+        """
+        today = datetime.now()
+        year, month = today.year, today.month
+        if month >= 11:  # 三季报已披露完
+            return [f"{year}0930", f"{year}0630", f"{year}0331", f"{year - 1}1231"]
+        if month >= 9:  # 三季报披露中, 取已披露完的半年报
+            return [f"{year}0630", f"{year}0331", f"{year - 1}1231"]
+        if month >= 5:  # 半年报披露中, 取一季报
+            return [f"{year}0331", f"{year - 1}1231"]
+        return [f"{year - 1}1231", f"{year - 1}0930"]
+
+    def _fetch_pb_pe_spot(self) -> pd.DataFrame:
+        """拉取全市场 PB/PE 快照, 返回 index=6位代码, columns=[pb, pe]。"""
+        ak = self._ensure_akshare()
+        df = pd.DataFrame(ak.stock_zh_a_spot_em())
+        if df.empty:
+            return pd.DataFrame(columns=["pb", "pe"])
+        code_col = self._pick_column(df, "代码", "code")
+        pb_col = self._pick_column(df, "市净率")
+        pe_col = self._pick_column(df, "市盈率-动态", "市盈率")
+        if code_col is None or pb_col is None or pe_col is None:
+            raise ValueError(f"实时行情缺少市净率/市盈率字段: {list(df.columns)}")
+        result = pd.DataFrame(
+            {
+                "code": df[code_col].astype(str).str.zfill(6),
+                "pb": pd.to_numeric(df[pb_col], errors="coerce"),
+                "pe": pd.to_numeric(df[pe_col], errors="coerce"),
+            }
+        )
+        return result.set_index("code")[["pb", "pe"]]
+
+    def get_pb_pe_spot(self) -> pd.DataFrame:
+        """获取全市场个股 PB/PE 快照; 指数为6位代码, 列为 pb/pe。"""
+        return self._cache.cached_call(
+            "get_pb_pe_spot",
+            {},
+            lambda _: self._fetch_pb_pe_spot(),
+            result_type="df",
+        )
+
+    def _fetch_market_pb_percentile(self) -> float:
+        """计算全市场中位数 PB 的历史分位 (0~100)。"""
+        ak = self._ensure_akshare()
+        df = pd.DataFrame(ak.stock_a_all_pb())
+        if df.empty or "middlePB" not in df.columns:
+            raise ValueError("全A市净率序列为空")
+        series = pd.to_numeric(df["middlePB"], errors="coerce").dropna()
+        if series.empty:
+            raise ValueError("全A市净率序列无有效值")
+        pb = float(series.iloc[-1])
+        quantile_col = "quantileInAllHistoryMiddlePB"
+        if quantile_col in df.columns:
+            quantile = pd.to_numeric(df[quantile_col], errors="coerce").dropna()
+            if not quantile.empty:
+                return round(float(quantile.iloc[-1]) * 100, 1)
+        return round(float((series <= pb).mean()) * 100, 1)
+
+    def get_market_pb_percentile(self) -> float:
+        """获取全市场 PB 历史分位 (0~100), 用于仓位管理。"""
+        return self._cache.cached_call(
+            "get_market_pb_percentile",
+            {},
+            lambda _: self._fetch_market_pb_percentile(),
+            result_type="float",
+        )
+
+    def _fetch_financial_snapshot(self, period: str) -> Dict[str, Dict[str, Any]]:
+        """按报告期拉取全市场业绩报表, 返回 {6位代码: {roe, revenue_growth, industry}}。"""
+        ak = self._ensure_akshare()
+        df = pd.DataFrame(ak.stock_yjbb_em(date=period))
+        if df.empty:
+            return {}
+        code_col = self._pick_column(df, "股票代码", "代码")
+        roe_col = self._pick_column(df, "净资产收益率")
+        growth_col = self._pick_column(df, "营业总收入-同比增长")
+        industry_col = self._pick_column(df, "所处行业")
+        if code_col is None or roe_col is None or growth_col is None:
+            raise ValueError(f"业绩报表缺少 ROE/营收增速字段: {list(df.columns)}")
+        snapshot: Dict[str, Dict[str, Any]] = {}
+        for _, row in df.iterrows():
+            code = self._to_ak_symbol(str(row.get(code_col) or "")).strip().zfill(6)
+            if not code.isdigit():
+                continue
+            industry = row.get(industry_col) if industry_col else None
+            if industry is not None and pd.isna(industry):
+                industry = None
+            snapshot[code] = {
+                "roe": self._to_float(row.get(roe_col)),
+                "revenue_growth": self._to_float(row.get(growth_col)),
+                "industry": "" if industry is None else str(industry),
+            }
+        return snapshot
+
+    def get_financial_snapshot(
+        self,
+        codes: Optional[Union[str, Sequence[str]]] = None,
+        date: Optional[str] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """获取全市场财务快照 (ROE/营收增速/行业); codes 非空时按代码过滤。
+
+        date 指定报告期 (如 "20260930"); 默认按披露进度推断最新报告期,
+        指定报告期无数据时逐级回退到更早的报告期。
+        """
+        wanted: Optional[set] = None
+        if codes:
+            wanted = {self._to_ak_symbol(item).strip().zfill(6) for item in self._as_list(codes)}
+        periods = [str(date)] if date else self._report_periods()
+        for period in periods:
+            snapshot = self._cache.cached_call(
+                "get_financial_snapshot",
+                {"date": period},
+                lambda _: self._fetch_financial_snapshot(period),
+                result_type="list_dict",
+            )
+            if not snapshot:
+                continue
+            if wanted is not None:
+                snapshot = {c: v for c, v in snapshot.items() if c in wanted}
+            if snapshot:
+                return snapshot
+        return {}

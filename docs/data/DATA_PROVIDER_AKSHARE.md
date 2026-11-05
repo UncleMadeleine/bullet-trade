@@ -50,6 +50,26 @@ Provider 内部会转换为 AKShare 接口常用的 6 位代码。也兼容 `SH`
 | 分红送配 | `stock_history_dividend_detail` | 仅股票，字段来自新浪财经 |
 | 证券信息 | `stock_individual_info_em` | 股票简称、行业、上市时间 |
 | 实时快照 | `stock_zh_a_spot_em`、ETF/LOF/指数现货接口 | 轮询式快照，非订阅推送 |
+| 全市场 PB/PE | `get_pb_pe_spot()` | 单次拉取全市场市净率/市盈率快照，返回 `index=6位代码, columns=[pb, pe]` |
+| 市场 PB 分位 | `get_market_pb_percentile()` | 全A中位数PB 的全历史分位（0~100），用于仓位管理 |
+| 财务快照 | `get_financial_snapshot(codes=None, date=None)` | 业绩报表批量取 ROE/营收增速/行业，返回 `{6位代码: {roe, revenue_growth, industry}}` |
+
+后三项是估值与财务扩展方法，不在聚宽标准 API 内，直接通过 provider 实例调用：
+
+```python
+from bullet_trade.data.api import get_data_provider
+
+provider = get_data_provider("akshare")
+pb_pe = provider.get_pb_pe_spot()               # 全市场 PB/PE
+percentile = provider.get_market_pb_percentile()  # 市场 PB 历史分位
+snapshot = provider.get_financial_snapshot(["000001.XSHE"])  # 财务快照
+```
+
+说明：
+
+- `get_financial_snapshot` 不接收聚宽 `query` 对象（与 `get_fundamentals` 不同），按报告期批量取全市场后过滤；`date` 缺省时按各报告期法定披露截止日推断最新报告期，无数据逐级回退。
+- 财务数据来自东方财富业绩报表，报告期内为静态快照；跨报告期比较需自行处理口径。
+- `stock_yjbb_em` 等公开接口偶发漏页会导致快照缺少数只标的，属数据源固有抖动。
 
 ## 字段与单位
 
@@ -74,7 +94,7 @@ Provider 内部会转换为 AKShare 接口常用的 6 位代码。也兼容 `SH`
 3. **无 tick 历史**：不实现 `get_ticks`；实时场景使用 `get_current_tick`/`get_live_current`。
 4. **无停牌和涨跌停字段**：停牌日会被数据源直接省略，涨跌停价返回 0，由上层规则兜底。
 5. **依赖公开网页接口**：AKShare 升级或上游页面改版可能导致接口失效；建议锁定版本并在策略侧处理异常。
-6. **不支持财务、行业、概念、龙虎榜等扩展接口**：这些方法会返回空或抛出未实现错误。
+6. **不支持聚宽 query 式财务接口**：`get_fundamentals` 未实现；估值与财务请使用 `get_pb_pe_spot()` / `get_market_pb_percentile()` / `get_financial_snapshot()` 三个扩展方法，行业、概念、龙虎榜等其余扩展接口仍返回空或抛未实现错误。
 
 ## 与 JQData 的差异
 
