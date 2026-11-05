@@ -5,28 +5,364 @@ LiveEngine 核心行为测试。
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import copy
+import importlib.util
 import shutil
-from datetime import date, datetime, timedelta, time as Time
+import sys
+import threading
+from datetime import date, datetime
+from datetime import time as Time
+from datetime import timedelta
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+from unittest.mock import AsyncMock
 
+import pandas as pd
 import pytest
-
 
 from bullet_trade.broker.base import BrokerBase
 from bullet_trade.core import pricing
 from bullet_trade.core.async_scheduler import AsyncScheduler
 from bullet_trade.core.event_bus import EventBus
-from bullet_trade.core.live_engine import LiveEngine, LivePortfolioProxy, TradingCalendarGuard
+from bullet_trade.core.globals import g, reset_globals
+from bullet_trade.core.live_engine import (
+    LiveConfig,
+    LiveEngine,
+    LivePortfolioProxy,
+    TradingCalendarGuard,
+)
+from bullet_trade.core.live_lock import LiveLockBusyError
 from bullet_trade.core.live_runtime import (
     load_strategy_metadata,
     load_subscription_state,
     persist_strategy_metadata,
     save_g,
 )
-from bullet_trade.core.globals import g, reset_globals
 from bullet_trade.core.models import Order, OrderStatus
-from bullet_trade.core.orders import order, clear_order_queue
+from bullet_trade.core.orders import (
+    LimitOrderStyle,
+    MarketOrderStyle,
+    cancel_order,
+    clear_order_queue,
+    get_order_queue,
+    order,
+)
+from bullet_trade.core.risk_control import RiskController
 from bullet_trade.core.runtime import set_current_engine
+from bullet_trade.data.providers.base import DataProvider
+from bullet_trade.data.providers.remote_qmt import RemoteQmtProvider
+
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+V2_BRIDGE_PATH = WORKSPACE_ROOT / "strategies" / "bt_strategies" / "sim" / "common" / "v2_bridge.py"
+_V2_SPEC = importlib.util.spec_from_file_location("bt_v2_bridge_live_engine_test", V2_BRIDGE_PATH)
+assert _V2_SPEC is not None and _V2_SPEC.loader is not None
+_V2_MODULE = importlib.util.module_from_spec(_V2_SPEC)
+sys.modules[_V2_SPEC.name] = _V2_MODULE
+_V2_SPEC.loader.exec_module(_V2_MODULE)
+AiStocksV2Broker = _V2_MODULE.AiStocksV2Broker
+V2ClientConfig = _V2_MODULE.V2ClientConfig
+
+
+class OfflineLiveProvider(DataProvider):
+    """
+    LiveEngine 测试专用离线数据源。
+
+    职责：为默认测试提供固定交易日、订阅和 tick 接口，避免 LiveEngine 单元测试误连真实行情源。
+    核心协作对象：`bullet_trade.data.api` 全局 provider 和 LiveEngine 的交易日/订阅刷新逻辑。
+    关键状态：仅维护内存中的 tick 订阅集合，不访问网络或磁盘缓存。
+    """
+
+    name = "offline_live"
+
+    def __init__(self) -> None:
+        """
+        初始化离线 provider。
+
+        Args:
+            无。
+
+        Returns:
+            None。创建空的 tick 订阅状态。
+        """
+        self.tick_symbols: set[str] = set()
+        self.tick_markets: set[str] = set()
+
+    def auth(
+        self,
+        user: Optional[str] = None,
+        pwd: Optional[str] = None,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+    ) -> None:
+        """
+        执行离线认证。
+
+        Args:
+            user: 兼容数据源认证签名，测试中不使用。
+            pwd: 兼容数据源认证签名，测试中不使用。
+            host: 兼容数据源认证签名，测试中不使用。
+            port: 兼容数据源认证签名，测试中不使用。
+
+        Returns:
+            None。该 provider 不访问外部行情服务。
+        """
+        return None
+
+    def get_trade_days(
+        self,
+        start_date: Optional[Union[str, datetime]] = None,
+        end_date: Optional[Union[str, datetime]] = None,
+        count: Optional[int] = None,
+    ) -> List[datetime]:
+        """
+        返回工作日交易日序列。
+
+        Args:
+            start_date: 查询开始日期。
+            end_date: 查询结束日期。
+            count: 需要返回的最近交易日数量。
+
+        Returns:
+            List[datetime]: 固定工作日交易日列表。
+        """
+        end_ts = pd.to_datetime(end_date or "2026-01-01").normalize()
+        if count is not None:
+            return list(pd.bdate_range(end=end_ts, periods=count).to_pydatetime())
+        start_ts = pd.to_datetime(start_date or end_ts).normalize()
+        return list(pd.bdate_range(start=start_ts, end=end_ts).to_pydatetime())
+
+    def get_price(
+        self,
+        security: Union[str, List[str]],
+        start_date: Optional[Union[str, datetime]] = None,
+        end_date: Optional[Union[str, datetime]] = None,
+        frequency: str = "daily",
+        fields: Optional[List[str]] = None,
+        skip_paused: bool = False,
+        fq: str = "pre",
+        count: Optional[int] = None,
+        panel: bool = True,
+        fill_paused: bool = True,
+        pre_factor_ref_date: Optional[Union[str, datetime]] = None,
+        prefer_engine: bool = False,
+        force_no_engine: bool = False,
+    ) -> pd.DataFrame:
+        """
+        返回固定行情。
+
+        Args:
+            security: 单个或多个证券代码。
+            start_date: 行情开始时间。
+            end_date: 行情结束时间。
+            frequency: 行情频率，测试中不影响固定返回。
+            fields: 需要返回的字段。
+            skip_paused: 兼容公开 API 参数，测试中不改变返回。
+            fq: 兼容复权参数，测试中不改变返回。
+            count: 需要返回的最近记录数量。
+            panel: 兼容公开 API 参数，多证券时返回 MultiIndex 列。
+            fill_paused: 兼容公开 API 参数，测试中不改变返回。
+            pre_factor_ref_date: 兼容动态复权参数，测试中不改变返回。
+            prefer_engine: 兼容 provider engine 参数，测试中不改变返回。
+            force_no_engine: 兼容 provider engine 参数，测试中不改变返回。
+
+        Returns:
+            pd.DataFrame: 固定价格行情表。
+        """
+        _ = (
+            frequency,
+            skip_paused,
+            fq,
+            fill_paused,
+            pre_factor_ref_date,
+            prefer_engine,
+            force_no_engine,
+        )
+        end_ts = pd.to_datetime(end_date or start_date or "2026-01-01").normalize()
+        if count is not None:
+            index = pd.bdate_range(end=end_ts, periods=count)
+        else:
+            start_ts = pd.to_datetime(start_date or end_ts).normalize()
+            index = pd.bdate_range(start=start_ts, end=end_ts)
+        if index.empty:
+            index = pd.DatetimeIndex([end_ts])
+
+        requested_fields = fields or ["open", "close", "high", "low", "volume", "money"]
+        securities = security if isinstance(security, list) else [security]
+
+        def _field_value(field: str) -> Any:
+            """
+            返回字段固定值。
+
+            Args:
+                field: 行情字段名。
+
+            Returns:
+                Any: 与字段类型匹配的固定值。
+            """
+            values: Dict[str, Any] = {
+                "open": 10.0,
+                "close": 10.0,
+                "high": 10.2,
+                "low": 9.8,
+                "high_limit": 11.0,
+                "low_limit": 9.0,
+                "paused": False,
+                "volume": 100000,
+                "money": 1000000.0,
+                "factor": 1.0,
+            }
+            return values.get(field, 10.0)
+
+        if len(securities) == 1:
+            return pd.DataFrame(
+                {field: [_field_value(field)] * len(index) for field in requested_fields},
+                index=index,
+            )
+
+        data = {
+            (field, code): [_field_value(field)] * len(index)
+            for field in requested_fields
+            for code in securities
+        }
+        return pd.DataFrame(data, index=index)
+
+    def get_all_securities(
+        self,
+        types: Union[str, List[str]] = "stock",
+        date: Optional[Union[str, datetime]] = None,
+    ) -> pd.DataFrame:
+        """
+        返回固定证券列表。
+
+        Args:
+            types: 证券类型过滤条件。
+            date: 查询日期。
+
+        Returns:
+            pd.DataFrame: 包含常用测试证券的证券表。
+        """
+        _ = types, date
+        return pd.DataFrame(
+            {"display_name": ["平安银行", "沪深300"], "type": ["stock", "index"]},
+            index=["000001.XSHE", "000300.XSHG"],
+        )
+
+    def get_index_stocks(
+        self,
+        index_symbol: str,
+        date: Optional[Union[str, datetime]] = None,
+    ) -> List[str]:
+        """
+        返回固定指数成分。
+
+        Args:
+            index_symbol: 指数代码。
+            date: 查询日期。
+
+        Returns:
+            List[str]: 固定股票列表。
+        """
+        _ = index_symbol, date
+        return ["000001.XSHE"]
+
+    def get_split_dividend(
+        self,
+        security: str,
+        start_date: Optional[Union[str, datetime]] = None,
+        end_date: Optional[Union[str, datetime]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        返回权益事件。
+
+        Args:
+            security: 证券代码。
+            start_date: 查询开始日期。
+            end_date: 查询结束日期。
+
+        Returns:
+            List[Dict[str, Any]]: LiveEngine 测试不覆盖分红，固定返回空列表。
+        """
+        _ = security, start_date, end_date
+        return []
+
+    def subscribe_ticks(self, symbols: List[str]) -> None:
+        """
+        记录 tick 订阅。
+
+        Args:
+            symbols: 需要订阅的证券代码列表。
+
+        Returns:
+            None。仅更新内存集合。
+        """
+        self.tick_symbols.update(symbols)
+
+    def subscribe_markets(self, markets: List[str]) -> None:
+        """
+        记录市场订阅。
+
+        Args:
+            markets: 需要订阅的市场列表。
+
+        Returns:
+            None。仅更新内存集合。
+        """
+        self.tick_markets.update(markets)
+
+    def unsubscribe_ticks(self, symbols: Optional[List[str]] = None) -> None:
+        """
+        取消 tick 订阅。
+
+        Args:
+            symbols: 需要取消的证券代码；为 None 时清空全部。
+
+        Returns:
+            None。仅更新内存集合。
+        """
+        if symbols is None:
+            self.tick_symbols.clear()
+            return
+        for symbol in symbols:
+            self.tick_symbols.discard(symbol)
+
+    def unsubscribe_markets(self, markets: Optional[List[str]] = None) -> None:
+        """
+        取消市场订阅。
+
+        Args:
+            markets: 需要取消的市场；为 None 时清空全部。
+
+        Returns:
+            None。仅更新内存集合。
+        """
+        if markets is None:
+            self.tick_markets.clear()
+            return
+        for market in markets:
+            self.tick_markets.discard(market)
+
+    def get_current_tick(
+        self,
+        security: str,
+        dt: Optional[Union[str, datetime]] = None,
+        df: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        返回固定 tick 快照。
+
+        Args:
+            security: 证券代码。
+            dt: 查询时间。
+            df: 是否返回 DataFrame，测试中固定返回 dict。
+
+        Returns:
+            Optional[Dict[str, Any]]: 已订阅证券返回快照，未订阅返回 None。
+        """
+        _ = dt, df
+        if security not in self.tick_symbols:
+            return None
+        return {"sid": security, "last_price": 10.0, "dt": datetime.now().isoformat()}
 
 
 class DummyBroker(BrokerBase):
@@ -47,7 +383,13 @@ class DummyBroker(BrokerBase):
         return True
 
     def get_account_info(self):
-        return {"account_id": "dummy", "account_type": "stock", "positions": [], "available_cash": 1000.0, "total_value": 1000.0}
+        return {
+            "account_id": "dummy",
+            "account_type": "stock",
+            "positions": [],
+            "available_cash": 1000.0,
+            "total_value": 1000.0,
+        }
 
     def get_positions(self):
         return []
@@ -99,7 +441,13 @@ class DummyBroker(BrokerBase):
             "available_cash": 888.0,
             "total_value": 999.0,
             "positions": [
-                {"security": "000001.XSHE", "amount": 100, "avg_cost": 10.0, "current_price": 11.0, "market_value": 1100.0}
+                {
+                    "security": "000001.XSHE",
+                    "amount": 100,
+                    "avg_cost": 10.0,
+                    "current_price": 11.0,
+                    "market_value": 1100.0,
+                }
             ],
         }
 
@@ -112,7 +460,11 @@ class DummyBroker(BrokerBase):
 
     def subscribe_ticks(self, symbols):
         for sym in symbols:
-            self._tick_snapshots[sym] = {"sid": sym, "last_price": 1.23, "dt": datetime.now().isoformat()}
+            self._tick_snapshots[sym] = {
+                "sid": sym,
+                "last_price": 1.23,
+                "dt": datetime.now().isoformat(),
+            }
 
     def unsubscribe_ticks(self, symbols=None):
         if not symbols:
@@ -123,6 +475,208 @@ class DummyBroker(BrokerBase):
 
     def get_current_tick(self, symbol: str):
         return self._tick_snapshots.get(symbol)
+
+
+class AccountBroker(DummyBroker):
+    def __init__(
+        self,
+        *,
+        account_id: str = "dummy",
+        account_key: str = "",
+        sub_account_id: str = "",
+    ):
+        super().__init__()
+        self.account_id = account_id
+        if account_key:
+            self.account_key = account_key
+        if sub_account_id:
+            self.sub_account_id = sub_account_id
+
+
+class FillAwareBroker(DummyBroker):
+    def __init__(self, *, fill_price: float):
+        super().__init__()
+        self.fill_price = fill_price
+        self.last_order_id = ""
+        self.submitted_price = 0.0
+        self.submitted_amount = 0
+        self.submitted_security = ""
+        self.submitted_market = False
+
+    async def buy(
+        self,
+        security: str,
+        amount: int,
+        price: float | None = None,
+        wait_timeout: float | None = None,
+        remark: str | None = None,
+        *,
+        market: bool = False,
+    ) -> str:
+        order_id = await super().buy(
+            security,
+            amount,
+            price,
+            wait_timeout=wait_timeout,
+            remark=remark,
+            market=market,
+        )
+        self.last_order_id = order_id
+        self.submitted_price = float(price or 0.0)
+        self.submitted_amount = int(amount)
+        self.submitted_security = security
+        self.submitted_market = bool(market)
+        return order_id
+
+    def sync_account(self):
+        self.account_sync_calls += 1
+        if not self.last_order_id:
+            return {
+                "available_cash": 100000.0,
+                "total_value": 100000.0,
+                "positions": [],
+            }
+        reserved_cash = self.submitted_amount * self.submitted_price
+        return {
+            "available_cash": 100000.0 - reserved_cash,
+            "total_value": 100000.0,
+            "positions": [
+                {
+                    "security": self.submitted_security,
+                    "amount": self.submitted_amount,
+                    "avg_cost": self.submitted_price,
+                    "current_price": self.fill_price,
+                    "market_value": self.fill_price * self.submitted_amount,
+                }
+            ],
+        }
+
+    def sync_orders(self):
+        self.order_sync_calls += 1
+        if not self.last_order_id:
+            return []
+        return [
+            {
+                "order_id": self.last_order_id,
+                "security": self.submitted_security,
+                "status": "filled",
+                "amount": self.submitted_amount,
+                "filled_amount": self.submitted_amount,
+                "price": self.submitted_price,
+                "avg_cost": self.fill_price,
+                "order_price": self.submitted_price,
+                "is_buy": True,
+            }
+        ]
+
+    def get_trades(
+        self,
+        order_id: str | None = None,
+        security: str | None = None,
+    ):
+        if not self.last_order_id:
+            return []
+        if order_id and str(order_id) != self.last_order_id:
+            return []
+        if security and security != self.submitted_security:
+            return []
+        return [
+            {
+                "trade_id": f"{self.last_order_id}-T1",
+                "order_id": self.last_order_id,
+                "security": self.submitted_security,
+                "amount": self.submitted_amount,
+                "price": self.fill_price,
+                "time": datetime.now().isoformat(),
+            }
+        ]
+
+
+class SequencedV2Client:
+    def __init__(self, responses: dict[str, list[object]]):
+        self.responses = {
+            action: [copy.deepcopy(item) for item in items] for action, items in responses.items()
+        }
+        self.calls: list[tuple[str, object, object]] = []
+
+    def connect(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def health(self):
+        return {"ok": True}
+
+    def request(self, action, payload=None, timeout=None):
+        self.calls.append((action, copy.deepcopy(payload), timeout))
+        queue = self.responses.get(action)
+        if not queue:
+            raise AssertionError(f"未预置或已耗尽 V2 响应: {action}")
+        return copy.deepcopy(queue.pop(0))
+
+
+def _build_v2_broker(client: SequencedV2Client) -> Any:
+    broker = AiStocksV2Broker(
+        V2ClientConfig(
+            host="127.0.0.1",
+            port=59620,
+            token="token",
+            account_key="lxm_main",
+            sub_account_id="btsim_core_etf",
+            strategy_name="test-v2",
+        )
+    )
+    broker.client = client
+    return broker
+
+
+def _build_v2_live_engine(tmp_path: Path, broker: BrokerBase) -> LiveEngine:
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime-v2"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=lambda: broker,
+        live_config=cfg,
+    )
+    return engine
+
+
+def _prime_live_engine(engine: LiveEngine, broker: BrokerBase) -> None:
+    loop = asyncio.get_running_loop()
+    engine._loop = loop
+    engine._order_lock = asyncio.Lock()
+    engine._stop_event = asyncio.Event()
+    engine.event_bus = EventBus(loop)
+    engine.async_scheduler = AsyncScheduler()
+    engine.broker = broker
+    engine._risk = None
+    engine.context.current_dt = datetime(2026, 4, 1, 10, 0, 0)
+    engine.context.portfolio.available_cash = 100000.0
+    engine.context.portfolio.transferable_cash = 100000.0
+    engine.context.portfolio.locked_cash = 0.0
+    engine.context.portfolio.total_value = 100000.0
+
+
+class LifecycleBroker(DummyBroker):
+    def __init__(self):
+        super().__init__()
+        self.before_open_calls = 0
+        self.after_close_calls = 0
+
+    def before_open(self) -> None:
+        self.before_open_calls += 1
+
+    def after_close(self) -> None:
+        self.after_close_calls += 1
 
 
 def _write_strategy(tmp_path: Path) -> Path:
@@ -164,6 +718,156 @@ def every_minute(context):
     path = tmp_path / "strategy_hooks.py"
     path.write_text(src, encoding="utf-8")
     return path
+
+
+@pytest.fixture(autouse=True)
+def _isolate_bullet_trade_home(monkeypatch, tmp_path):
+    """
+    隔离 LiveEngine 测试的运行目录和行情 provider。
+
+    Args:
+        monkeypatch: pytest 提供的临时属性替换工具。
+        tmp_path: pytest 提供的临时目录。
+
+    Returns:
+        None。测试结束后自动恢复环境变量和全局 provider。
+    """
+    from bullet_trade.data import api as data_api
+
+    provider = OfflineLiveProvider()
+    monkeypatch.setenv("BULLET_TRADE_HOME", str(tmp_path))
+    monkeypatch.setattr(data_api, "_provider", provider, raising=False)
+    monkeypatch.setattr(data_api, "_provider_cache", {provider.name: provider}, raising=False)
+    monkeypatch.setattr(data_api, "_provider_auth_attempted", {provider.name: True}, raising=False)
+    monkeypatch.setattr(data_api, "_auth_attempted", True, raising=False)
+
+
+def test_live_config_defaults_risk_check_to_false(monkeypatch):
+    monkeypatch.delenv("RISK_CHECK_ENABLED", raising=False)
+
+    cfg = LiveConfig.load()
+
+    assert cfg.risk_check_enabled is False
+
+
+def test_live_config_parses_string_bool_overrides(monkeypatch):
+    monkeypatch.delenv("RISK_CHECK_ENABLED", raising=False)
+    monkeypatch.delenv("ACCOUNT_SYNC_ENABLED", raising=False)
+
+    cfg = LiveConfig.load(
+        {
+            "risk_check_enabled": "false",
+            "account_sync_enabled": "false",
+        }
+    )
+
+    assert cfg.risk_check_enabled is False
+    assert cfg.account_sync_enabled is False
+
+
+def _build_lock_test_engine(
+    tmp_path: Path,
+    strategy: Path,
+    *,
+    runtime_name: str,
+    account_id: str = "dummy",
+    account_key: str = "",
+    sub_account_id: str = "",
+) -> LiveEngine:
+    cfg = {
+        "runtime_dir": str(tmp_path / runtime_name),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    return LiveEngine(
+        strategy_file=strategy,
+        broker_factory=lambda: AccountBroker(
+            account_id=account_id,
+            account_key=account_key,
+            sub_account_id=sub_account_id,
+        ),
+        live_config=cfg,
+    )
+
+
+def test_live_engine_rejects_duplicate_instance_same_account(monkeypatch, tmp_path):
+    monkeypatch.setenv("BULLET_TRADE_HOME", str(tmp_path))
+    strategy = _write_strategy(tmp_path)
+    engine1 = _build_lock_test_engine(
+        tmp_path, strategy, runtime_name="runtime-a", account_id="acct-main"
+    )
+    engine2 = _build_lock_test_engine(
+        tmp_path, strategy, runtime_name="runtime-b", account_id="acct-main"
+    )
+
+    engine1._acquire_live_locks()
+    try:
+        with pytest.raises(LiveLockBusyError, match="重复 live 实例"):
+            engine2._acquire_live_locks()
+    finally:
+        engine2._release_live_locks()
+        engine1._release_live_locks()
+
+
+def test_live_engine_rejects_shared_runtime_dir_across_accounts(monkeypatch, tmp_path):
+    monkeypatch.setenv("BULLET_TRADE_HOME", str(tmp_path))
+    strategy = _write_strategy(tmp_path)
+    engine1 = _build_lock_test_engine(
+        tmp_path,
+        strategy,
+        runtime_name="shared-runtime",
+        account_key="parent-a",
+        sub_account_id="sub-a",
+    )
+    engine2 = _build_lock_test_engine(
+        tmp_path,
+        strategy,
+        runtime_name="shared-runtime",
+        account_key="parent-a",
+        sub_account_id="sub-b",
+    )
+
+    engine1._acquire_live_locks()
+    try:
+        with pytest.raises(LiveLockBusyError, match="RUNTIME_DIR 已被其他 live 实例占用"):
+            engine2._acquire_live_locks()
+    finally:
+        engine2._release_live_locks()
+        engine1._release_live_locks()
+
+
+def test_live_engine_allows_parallel_instances_for_different_accounts(monkeypatch, tmp_path):
+    monkeypatch.setenv("BULLET_TRADE_HOME", str(tmp_path))
+    strategy = _write_strategy(tmp_path)
+    engine1 = _build_lock_test_engine(
+        tmp_path,
+        strategy,
+        runtime_name="runtime-sub-a",
+        account_key="parent-a",
+        sub_account_id="sub-a",
+    )
+    engine2 = _build_lock_test_engine(
+        tmp_path,
+        strategy,
+        runtime_name="runtime-sub-b",
+        account_key="parent-a",
+        sub_account_id="sub-b",
+    )
+
+    try:
+        engine1._acquire_live_locks()
+        engine2._acquire_live_locks()
+        assert engine1._runtime_lock is not None
+        assert engine1._instance_lock is not None
+        assert engine2._runtime_lock is not None
+        assert engine2._instance_lock is not None
+    finally:
+        engine2._release_live_locks()
+        engine1._release_live_locks()
 
 
 @pytest.mark.asyncio
@@ -264,6 +968,159 @@ async def test_tick_subscription_and_account_sync(tmp_path):
     await engine._account_sync_step()
     assert engine.context.portfolio.available_cash == 888.0
     assert "000001.XSHE" in engine.context.portfolio.positions
+
+    await engine._shutdown()
+
+
+@pytest.mark.asyncio
+async def test_live_account_sync_positions_support_broker_suffix_aliases(tmp_path):
+    class BrokerSuffixDummy(DummyBroker):
+        def sync_account(self):
+            self.account_sync_calls += 1
+            return {
+                "available_cash": 350608.27,
+                "total_value": 499979.27,
+                "positions": [
+                    {
+                        "security": "511880.SH",
+                        "amount": 500,
+                        "closeable_amount": 500,
+                        "avg_cost": 100.601,
+                        "current_price": 100.598,
+                        "market_value": 50299.0,
+                    },
+                    {
+                        "security": "000001.SZ",
+                        "amount": 9600,
+                        "closeable_amount": 0,
+                        "avg_cost": 10.32,
+                        "current_price": 10.32,
+                        "market_value": 99072.0,
+                    },
+                ],
+            }
+
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_interval": 1,
+        "account_sync_enabled": True,
+        "order_sync_enabled": False,
+        "tick_subscription_limit": 2,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+        "scheduler_market_periods": "09:30-11:30,13:00-15:00",
+    }
+    broker = BrokerSuffixDummy()
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=lambda: broker,
+        live_config=cfg,
+        now_provider=lambda: datetime(2025, 1, 1, 9, 0, 0),
+    )
+    loop = asyncio.get_running_loop()
+    engine._loop = loop
+    engine._stop_event = asyncio.Event()
+    engine.event_bus = EventBus(loop)
+    engine.async_scheduler = AsyncScheduler()
+
+    await engine._bootstrap()
+    await engine._account_sync_step()
+
+    positions = engine.context.portfolio.positions
+    assert positions["511880.XSHG"].total_amount == 500
+    assert positions.get("511880.XSHG").closeable_amount == 500
+    assert positions["000001.XSHE"].total_amount == 9600
+    assert list(positions.keys()) == ["511880.SH", "000001.SZ"]
+    assert len(list(positions.values())) == 2
+    assert engine.context.portfolio.positions_value == pytest.approx(149371.0)
+
+    stock_sub = engine.context.portfolio.subportfolios["stock"]
+    assert stock_sub.positions["511880.XSHG"].total_amount == 500
+    assert stock_sub.positions["000001.XSHE"].closeable_amount == 0
+
+    await engine._shutdown()
+
+
+@pytest.mark.asyncio
+async def test_live_account_sync_accepts_huaxin_nullable_market_fields_atomically(tmp_path):
+    """验证华鑫不提供市值和现价时仍保留真实可卖持仓。
+
+    Args:
+        tmp_path: pytest 提供的临时运行目录。
+
+    Returns:
+        None；合法空行情字段成功应用，非法后续快照不清空旧持仓即通过。
+    """
+
+    class HuaxinNullableMarketDummy(DummyBroker):
+        """返回华鑫 Trader 真实 nullable 行情字段形态的 Broker 替身。"""
+
+        def sync_account(self):
+            """返回资金和 511880 可卖持仓联合快照。
+
+            Returns:
+                dict: ``price`` 与 ``market_value`` 均为 None 的合法快照。
+            """
+
+            self.account_sync_calls += 1
+            return {
+                "available_cash": 1326.84,
+                "total_value": None,
+                "positions": [
+                    {
+                        "security": "511880.XSHG",
+                        "amount": 2000,
+                        "closeable_amount": 2000,
+                        "avg_cost": 100.0,
+                        "price": None,
+                        "market_value": None,
+                    }
+                ],
+            }
+
+    strategy = _write_strategy(tmp_path)
+    broker = HuaxinNullableMarketDummy()
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=lambda: broker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "g_autosave_enabled": False,
+            "account_sync_enabled": False,
+            "order_sync_enabled": False,
+            "tick_sync_enabled": False,
+            "risk_check_enabled": False,
+            "broker_heartbeat_interval": 0,
+        },
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._stop_event = asyncio.Event()
+    engine.event_bus = EventBus(engine._loop)
+    engine.async_scheduler = AsyncScheduler()
+
+    await engine._bootstrap()
+    await engine._account_sync_step()
+
+    position = engine.context.portfolio.positions["511880.XSHG"]
+    assert position.total_amount == 2000
+    assert position.closeable_amount == 2000
+    assert position.price == 0.0
+    assert position.value == 0.0
+    last_refresh = engine._last_account_refresh
+
+    broker.sync_account = lambda: {
+        "available_cash": 0,
+        "positions": [{"security": "511880.XSHG", "amount": "invalid"}],
+    }
+    await engine._account_sync_step()
+
+    preserved = engine.context.portfolio.positions["511880.XSHG"]
+    assert preserved.total_amount == 2000
+    assert preserved.closeable_amount == 2000
+    assert engine._last_account_refresh == last_refresh
 
     await engine._shutdown()
 
@@ -481,6 +1338,8 @@ async def test_strategy_start_date_persisted_and_restored(tmp_path):
 
 @pytest.mark.asyncio
 async def test_calendar_guard_skips_weekend(monkeypatch):
+    """验证交易日查询失败时，周末与工作日都保持失败关闭。"""
+
     guard = TradingCalendarGuard({"calendar_skip_weekend": True, "calendar_retry_minutes": 15})
 
     def _raise(*args, **kwargs):
@@ -494,12 +1353,15 @@ async def test_calendar_guard_skips_weekend(monkeypatch):
 
     monday = datetime(2025, 1, 6, 9, 0)
     result = await guard.ensure_trade_day(monday)
-    assert result is True
-    assert guard._confirmed_date == monday.date()
+    assert result is False
+    assert guard._confirmed_date is None
+    assert guard._next_check == monday + timedelta(minutes=15)
 
 
 @pytest.mark.asyncio
 async def test_calendar_guard_weekend_allowed(monkeypatch):
+    """验证关闭周末快速跳过后，交易日查询异常仍不会放行。"""
+
     guard = TradingCalendarGuard({"calendar_skip_weekend": False})
 
     def _raise(*args, **kwargs):
@@ -508,8 +1370,8 @@ async def test_calendar_guard_weekend_allowed(monkeypatch):
     monkeypatch.setattr("bullet_trade.data.api.get_trade_days", _raise, raising=False)
     sunday = datetime(2025, 1, 5, 9, 0)
     result = await guard.ensure_trade_day(sunday)
-    assert result is True
-    assert guard._confirmed_date == sunday.date()
+    assert result is False
+    assert guard._confirmed_date is None
 
 
 @pytest.mark.asyncio
@@ -524,6 +1386,151 @@ async def test_calendar_guard_list_includes_target(monkeypatch):
     result = await guard.ensure_trade_day(monday)
     assert result is True
     assert guard._confirmed_date == monday.date()
+
+
+@pytest.mark.asyncio
+async def test_calendar_guard_queries_provider_outside_event_loop(monkeypatch):
+    """验证交易日 guard 在线程中调用同步 provider，兼容 Django ORM。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具，用于注入只能在线程中调用的交易日函数。
+
+    Returns:
+        None: 查询在线程池完成且目标交易日被确认。
+    """
+
+    event_loop_thread = threading.get_ident()
+    query_threads: list[int] = []
+
+    def _thread_only_days(*_args: Any, **_kwargs: Any) -> list[str]:
+        """模拟在事件循环线程调用时会失败的同步 Django provider。
+
+        Args:
+            *_args: 兼容 ``get_trade_days`` 的位置参数。
+            **_kwargs: 兼容 ``get_trade_days`` 的关键字参数。
+
+        Returns:
+            list[str]: 包含目标日期的固定交易日结果。
+        """
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("同步交易日查询仍运行在 asyncio event loop")
+        query_threads.append(threading.get_ident())
+        return ["2025-01-06"]
+
+    monkeypatch.setattr(
+        "bullet_trade.data.api.get_trade_days",
+        _thread_only_days,
+        raising=False,
+    )
+    guard = TradingCalendarGuard(
+        {"calendar_skip_weekend": True, "calendar_retry_minutes": 1}
+    )
+
+    result = await guard.ensure_trade_day(datetime(2025, 1, 6, 9, 0))
+
+    assert result is True
+    assert query_threads
+    assert all(thread_id != event_loop_thread for thread_id in query_threads)
+
+
+@pytest.mark.asyncio
+async def test_live_engine_refreshes_trade_calendar_outside_event_loop(tmp_path, monkeypatch):
+    """验证新交易日的 180 日 provider 刷新同样在线程池执行。
+
+    Args:
+        tmp_path: pytest 临时目录，用于隔离策略和 LiveRuntime 文件。
+        monkeypatch: pytest 属性替换夹具，用于注入线程敏感 provider。
+
+    Returns:
+        None: 日历刷新完成且同步 provider 未进入 asyncio event loop。
+    """
+
+    event_loop_thread = threading.get_ident()
+    query_threads: list[int] = []
+
+    class _ThreadOnlyProvider:
+        """模拟只能在非事件循环线程执行的同步行情 provider。
+
+        职责：冻结新交易日刷新所需的最小同步日历合同。
+        核心协作对象：``LiveEngine._ensure_trading_day`` 的 provider 调用边界。
+        关键状态：通过外层 ``query_threads`` 记录实际调用线程，不访问网络或磁盘。
+        """
+
+        def get_trade_days(self, **_kwargs: Any) -> list[date]:
+            """返回固定日历并拒绝事件循环线程调用。
+
+            Args:
+                **_kwargs: 兼容 provider 交易日查询参数。
+
+            Returns:
+                list[date]: 包含目标交易日的固定日期列表。
+            """
+
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("同步 provider 刷新仍运行在 asyncio event loop")
+            query_threads.append(threading.get_ident())
+            return [date(2025, 1, 2)]
+
+    def _frozen_now() -> datetime:
+        """返回测试使用的固定当前时间。
+
+        Returns:
+            datetime: 2025-01-02 09:00 的固定时间。
+        """
+
+        return datetime(2025, 1, 2, 9, 0)
+
+    def _build_thread_only_provider() -> _ThreadOnlyProvider:
+        """构造本测试的线程敏感 provider。
+
+        Returns:
+            _ThreadOnlyProvider: 不访问网络的同步日历 provider。
+        """
+
+        return _ThreadOnlyProvider()
+
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime-calendar-thread"),
+            "g_autosave_enabled": False,
+            "account_sync_enabled": False,
+            "order_sync_enabled": False,
+            "tick_sync_enabled": False,
+            "risk_check_enabled": False,
+            "broker_heartbeat_interval": 0,
+            "scheduler_market_periods": "09:30-11:30,13:00-15:00",
+        },
+        now_provider=_frozen_now,
+    )
+    loop = asyncio.get_running_loop()
+    engine._loop = loop
+    engine._stop_event = asyncio.Event()
+    engine.event_bus = EventBus(loop)
+    engine.async_scheduler = AsyncScheduler()
+    await engine._bootstrap()
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_data_provider",
+        _build_thread_only_provider,
+    )
+
+    await engine._ensure_trading_day(date(2025, 1, 2))
+
+    assert query_threads
+    assert all(thread_id != event_loop_thread for thread_id in query_threads)
+    assert date(2025, 1, 2) in engine._trade_calendar
+    await engine._shutdown()
 
 
 @pytest.mark.asyncio
@@ -651,6 +1658,786 @@ async def test_live_engine_event_timeout_drops_minute(tmp_path, caplog):
     await engine._shutdown()
 
 
+def test_live_config_reads_opt_in_schedule_error_guard(monkeypatch):
+    """验证正式 producer 可通过环境变量显式启用调度失败退出。"""
+    monkeypatch.setenv("BT_LIVE_FAIL_ON_SCHEDULE_ERROR", "true")
+
+    config = LiveConfig.load()
+
+    assert config.fail_on_schedule_error is True
+
+
+@pytest.mark.asyncio
+async def test_live_engine_schedule_error_guard_preserves_cursor(tmp_path, monkeypatch):
+    """验证开启保护后任务错误会在游标持久化前使引擎失败。"""
+    strategy = _write_strategy(tmp_path)
+    scheduled = datetime(2025, 1, 2, 9, 31)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "fail_on_schedule_error": True,
+            "checkpoint_persistence_enabled": True,
+        },
+    )
+    engine.async_scheduler = AsyncMock()
+    engine.async_scheduler.trigger.return_value = {"daily__publish_09:31:00": {"error": ""}}
+    persisted: list[datetime] = []
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.persist_scheduler_cursor",
+        lambda value: persisted.append(value),
+    )
+
+    with pytest.raises(RuntimeError, match="daily__publish_09:31:00"):
+        await engine._handle_minute_tick(scheduled)
+
+    assert engine._last_schedule_dt is None
+    assert persisted == []
+
+
+@pytest.mark.asyncio
+async def test_schedule_error_guard_rejects_only_new_batch_orders(tmp_path):
+    """验证失败批次不提交新订单，且批次前已有订单保持在队列中。
+
+    Args:
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None。
+
+    Side Effects:
+        临时注册 LiveEngine 为当前引擎，并在结束时清空测试订单队列。
+    """
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "fail_on_schedule_error": True,
+            "checkpoint_persistence_enabled": True,
+        },
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._startup_phase = "ready"
+    engine.broker = DummyBroker()
+    engine.async_scheduler = AsyncMock()
+    clear_order_queue()
+    set_current_engine(None)
+    existing_order = order("000002.XSHE", 100, price=9.0)
+    assert existing_order is not None
+    batch_order: Optional[Order] = None
+
+    async def _trigger(*_args, **_kwargs):
+        """在线程中创建本批订单并返回稳定的失败回执。
+
+        Args:
+            *_args: 兼容 AsyncScheduler.trigger 的位置参数。
+            **_kwargs: 兼容 AsyncScheduler.trigger 的关键字参数。
+
+        Returns:
+            Dict[str, Dict[str, str]]: 含任务错误的调度回执。
+
+        Side Effects:
+            创建一笔订单并写入 ``batch_order``。
+        """
+        nonlocal batch_order
+        batch_order = await asyncio.to_thread(
+            order,
+            "000001.XSHE",
+            100,
+            price=10.0,
+        )
+        await asyncio.sleep(0)
+        return {"daily__failed": {"error": "task failed"}}
+
+    engine.async_scheduler.trigger.side_effect = _trigger
+    set_current_engine(engine)
+    try:
+        with pytest.raises(RuntimeError, match="daily__failed"):
+            await engine._handle_minute_tick(datetime(2025, 1, 2, 9, 31))
+        await asyncio.sleep(0)
+
+        assert engine.broker.orders == []
+        assert get_order_queue() == [existing_order]
+        assert existing_order.status == OrderStatus.open
+        assert batch_order is not None
+        assert batch_order.status == OrderStatus.rejected
+        assert batch_order.extra["rejection_reason"] == "scheduler_task_failed"
+    finally:
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_schedule_error_guard_processes_batch_after_success(tmp_path):
+    """验证安全调度批次全部成功后才统一向内存 Broker 提交订单。
+
+    Args:
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None。
+
+    Side Effects:
+        临时注册 LiveEngine，并向 DummyBroker 提交一笔合成限价单。
+    """
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "fail_on_schedule_error": True,
+            "checkpoint_persistence_enabled": True,
+        },
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._startup_phase = "ready"
+    engine.broker = DummyBroker()
+    engine.async_scheduler = AsyncMock()
+    engine._maybe_emit_market_events = AsyncMock()
+    engine._maybe_handle_data = AsyncMock()
+    clear_order_queue()
+
+    async def _trigger(*_args, **_kwargs):
+        """创建订单并确认调度结果确定前 Broker 仍为空。
+
+        Args:
+            *_args: 兼容 AsyncScheduler.trigger 的位置参数。
+            **_kwargs: 兼容 AsyncScheduler.trigger 的关键字参数。
+
+        Returns:
+            Dict[str, Dict[str, None]]: 成功调度回执。
+
+        Side Effects:
+            在线程中创建一笔合成订单。
+        """
+        await asyncio.to_thread(order, "000001.XSHE", 100, price=10.0)
+        await asyncio.sleep(0)
+        assert engine.broker.orders == []
+        return {"daily__success": {"result": None}}
+
+    engine.async_scheduler.trigger.side_effect = _trigger
+    set_current_engine(engine)
+    try:
+        await engine._handle_minute_tick(datetime(2025, 1, 2, 9, 31))
+
+        assert engine.broker.orders == [("000001.XSHE", 100, 10.0, "buy", False)]
+        assert get_order_queue() == []
+    finally:
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_schedule_fail_fast_can_keep_executor_order_submission_synchronous(tmp_path):
+    """验证执行器可在保留调度异常退出时同步取得券商订单号。
+
+    Args:
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None: 回调内取得券商订单号且 Broker 只收到一次委托时通过。
+
+    Side Effects:
+        临时注册 LiveEngine，并向内存 DummyBroker 提交一笔合成限价单。
+    """
+
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "fail_on_schedule_error": True,
+        },
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._startup_phase = "ready"
+    engine.broker = DummyBroker()
+    engine.async_scheduler = AsyncMock()
+    engine._maybe_emit_market_events = AsyncMock()
+    engine._maybe_handle_data = AsyncMock()
+    clear_order_queue()
+    submitted_order: Optional[Order] = None
+
+    async def _trigger(*_args, **_kwargs):
+        """在线程回调中提交订单并验证同步 broker identity。
+
+        Args:
+            *_args: 兼容 AsyncScheduler.trigger 的位置参数。
+            **_kwargs: 兼容 AsyncScheduler.trigger 的关键字参数。
+
+        Returns:
+            Dict[str, Dict[str, None]]: 成功调度回执。
+
+        Side Effects:
+            创建一笔订单并写入 ``submitted_order``。
+        """
+
+        nonlocal submitted_order
+        submitted_order = await asyncio.to_thread(
+            order,
+            "000001.XSHE",
+            100,
+            price=10.0,
+        )
+        assert submitted_order is not None
+        assert getattr(submitted_order, "_broker_order_id", None) == "buy-1"
+        return {"daily__executor": {"result": None}}
+
+    engine.async_scheduler.trigger.side_effect = _trigger
+    set_current_engine(engine)
+    try:
+        await engine._handle_minute_tick(datetime(2025, 1, 2, 9, 31))
+
+        assert engine.broker.orders == [("000001.XSHE", 100, 10.0, "buy", False)]
+        assert get_order_queue() == []
+    finally:
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_live_engine_schedule_trigger_error_guard_stops_before_cursor_and_events(
+    tmp_path, monkeypatch
+):
+    """验证开启保护后调度器自身异常不会被吞掉或推进本分钟。"""
+    strategy = _write_strategy(tmp_path)
+    scheduled = datetime(2025, 1, 2, 9, 31)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "fail_on_schedule_error": True,
+        },
+    )
+    engine.async_scheduler = AsyncMock()
+    engine.async_scheduler.trigger.side_effect = RuntimeError("trigger failed")
+    engine._maybe_emit_market_events = AsyncMock()
+    engine._maybe_handle_data = AsyncMock()
+    engine._process_orders = AsyncMock()
+    persisted: list[datetime] = []
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.persist_scheduler_cursor",
+        lambda value: persisted.append(value),
+    )
+
+    with pytest.raises(RuntimeError, match="调度器触发失败"):
+        await engine._handle_minute_tick(scheduled)
+
+    assert engine._last_schedule_dt is None
+    assert persisted == []
+    engine._maybe_emit_market_events.assert_not_awaited()
+    engine._maybe_handle_data.assert_not_awaited()
+    engine._process_orders.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_schedule_trigger_exception_rejects_new_batch_order(tmp_path):
+    """验证调度器自身抛异常时，本批订单同样不会到达 Broker。
+
+    Args:
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None。
+
+    Side Effects:
+        临时注册 LiveEngine，并在结束时清空测试订单队列。
+    """
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "fail_on_schedule_error": True,
+            "checkpoint_persistence_enabled": True,
+        },
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._startup_phase = "ready"
+    engine.broker = DummyBroker()
+    engine.async_scheduler = AsyncMock()
+    clear_order_queue()
+    batch_order: Optional[Order] = None
+
+    async def _trigger(*_args, **_kwargs):
+        """创建批次订单后模拟调度器自身异常。
+
+        Args:
+            *_args: 兼容 AsyncScheduler.trigger 的位置参数。
+            **_kwargs: 兼容 AsyncScheduler.trigger 的关键字参数。
+
+        Returns:
+            None；固定抛出异常，不会正常返回。
+
+        Raises:
+            RuntimeError: 固定模拟调度器失败。
+
+        Side Effects:
+            创建一笔订单并写入 ``batch_order``。
+        """
+        nonlocal batch_order
+        batch_order = await asyncio.to_thread(
+            order,
+            "000001.XSHE",
+            100,
+            price=10.0,
+        )
+        await asyncio.sleep(0)
+        raise RuntimeError("trigger failed")
+
+    engine.async_scheduler.trigger.side_effect = _trigger
+    set_current_engine(engine)
+    try:
+        with pytest.raises(RuntimeError, match="调度器触发失败"):
+            await engine._handle_minute_tick(datetime(2025, 1, 2, 9, 31))
+        await asyncio.sleep(0)
+
+        assert engine.broker.orders == []
+        assert get_order_queue() == []
+        assert batch_order is not None
+        assert batch_order.status == OrderStatus.rejected
+        assert batch_order.extra["rejection_reason"] == "scheduler_trigger_failed"
+    finally:
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_live_order_drain_preserves_concurrent_append(monkeypatch, tmp_path):
+    """验证 LiveEngine 原子取单不会吞掉并发追加的下一批订单。
+
+    Args:
+        monkeypatch: pytest 提供的临时属性替换工具。
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None。
+
+    Side Effects:
+        启动一个受控线程向测试队列追加订单，结束时清理队列。
+    """
+    from bullet_trade.core import live_engine as live_engine_module
+
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={"runtime_dir": str(tmp_path / "runtime")},
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._startup_phase = "ready"
+    engine.broker = DummyBroker()
+    clear_order_queue()
+    set_current_engine(engine)
+    monkeypatch.setattr(
+        "bullet_trade.core.orders._trigger_order_processing",
+        lambda _timeout: None,
+    )
+    first_order = order("000001.XSHE", 100, price=10.0)
+    assert first_order is not None
+    drain_completed = threading.Event()
+    append_completed = threading.Event()
+    append_result: Dict[str, Any] = {}
+    original_drain = live_engine_module._drain_order_queue
+
+    def _controlled_drain() -> List[Order]:
+        """原子取出首批订单后等待并发订单进入新队列。
+
+        Returns:
+            List[Order]: 原子取出的首批订单。
+
+        Side Effects:
+            设置 ``drain_completed`` 并等待 ``append_completed``。
+        """
+        drained = original_drain()
+        drain_completed.set()
+        assert append_completed.wait(timeout=2)
+        return drained
+
+    def _append_after_drain() -> None:
+        """在首批队列已原子取出后追加下一批订单。
+
+        Returns:
+            None。
+
+        Side Effects:
+            写入 ``append_result`` 并设置 ``append_completed``。
+        """
+        try:
+            assert drain_completed.wait(timeout=2)
+            append_result["order"] = order("000002.XSHE", 100, price=9.0)
+        except BaseException as exc:
+            append_result["error"] = exc
+        finally:
+            append_completed.set()
+
+    monkeypatch.setattr(live_engine_module, "_drain_order_queue", _controlled_drain)
+    worker = threading.Thread(target=_append_after_drain)
+    worker.start()
+    try:
+        await engine._process_orders(datetime(2025, 1, 2, 9, 31))
+        worker.join(timeout=2)
+
+        assert worker.is_alive() is False
+        assert "error" not in append_result
+        assert engine.broker.orders == [("000001.XSHE", 100, 10.0, "buy", False)]
+        assert get_order_queue() == [append_result["order"]]
+    finally:
+        worker.join(timeout=2)
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_failed_batch_rejects_only_tagged_orders_and_latches_engine(
+    monkeypatch,
+    tmp_path,
+):
+    """验证失败分区不误拒批次外订单，并持久锁死后续写请求。
+
+    Args:
+        monkeypatch: pytest 提供的临时属性替换工具。
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None。
+
+    Side Effects:
+        启动一个不继承批次 ContextVar 的线程创建无关订单，
+        并在结束时清理测试队列和当前引擎。
+    """
+    from bullet_trade.core.orders import (
+        _order_batch_scope,
+        _reject_order_batch,
+    )
+
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={"runtime_dir": str(tmp_path / "runtime")},
+    )
+    engine._startup_phase = "ready"
+    engine._schedule_batch_active = True
+    engine.broker = DummyBroker()
+    clear_order_queue()
+    set_current_engine(engine)
+    monkeypatch.setattr(
+        "bullet_trade.core.orders._trigger_order_processing",
+        lambda _timeout: None,
+    )
+    unrelated_result: Dict[str, Any] = {}
+
+    def _create_unrelated_order() -> None:
+        """在独立线程中创建不继承调度批次 token 的订单。
+
+        Returns:
+            None。
+
+        Side Effects:
+            将订单或异常写入 ``unrelated_result``。
+        """
+        try:
+            unrelated_result["order"] = order("000003.XSHE", 100, price=8.0)
+        except BaseException as exc:
+            unrelated_result["error"] = exc
+
+    worker: Optional[threading.Thread] = None
+    try:
+        with _order_batch_scope() as batch:
+            batch_order = order("000002.XSHE", 100, price=9.0)
+            assert batch_order is not None
+
+            worker = threading.Thread(target=_create_unrelated_order)
+            worker.start()
+            worker.join(timeout=2)
+            assert worker.is_alive() is False
+            assert "error" not in unrelated_result
+
+            rejected_count = _reject_order_batch(
+                batch,
+                engine,
+                "scheduler_task_failed",
+            )
+
+        unrelated_order = unrelated_result["order"]
+        assert unrelated_order is not None
+        assert rejected_count == 1
+        assert batch_order.status == OrderStatus.rejected
+        assert unrelated_order.status != OrderStatus.rejected
+        assert "rejection_reason" not in unrelated_order.extra
+        assert get_order_queue() == [unrelated_order]
+
+        await engine._process_orders(datetime(2025, 1, 2, 9, 31))
+        assert engine.broker.orders == []
+        assert get_order_queue() == [unrelated_order]
+
+        with pytest.raises(RuntimeError, match="schedule_batch_state=failed"):
+            order("000004.XSHE", 100, price=7.0)
+    finally:
+        if worker is not None:
+            worker.join(timeout=2)
+        engine._schedule_batch_active = False
+        clear_order_queue()
+        set_current_engine(None)
+
+
+def test_failed_schedule_latch_keeps_broker_cancel_available(tmp_path):
+    """验证调度失败锁存阻止新单但不阻断处置已有订单的 Broker 撤单。
+
+    Args:
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None。
+
+    Side Effects:
+        通过 DummyBroker 执行一次内存撤单，并临时注册 LiveEngine。
+    """
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={"runtime_dir": str(tmp_path / "runtime")},
+    )
+    engine._startup_phase = "ready"
+    engine._schedule_batch_failed_reason = "scheduler_task_failed"
+    engine.broker = DummyBroker()
+    engine._loop = None
+    submitted_order = Order(
+        order_id="local-order",
+        security="000001.XSHE",
+        amount=100,
+        status=OrderStatus.open,
+    )
+    setattr(submitted_order, "_broker_order_id", "broker-order")
+    set_current_engine(engine)
+    try:
+        assert cancel_order(submitted_order) is True
+        assert submitted_order.status == OrderStatus.canceling
+    finally:
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_failed_batch_rejects_late_context_order_before_enqueue(
+    monkeypatch,
+    tmp_path,
+):
+    """验证已过前置校验但迟到入队的失败批次订单仍被原子拒绝。
+
+    Args:
+        monkeypatch: pytest 提供的临时属性替换工具。
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None。
+
+    Side Effects:
+        启动携带批次 ContextVar 的受控线程，并临时包装订单入队函数。
+    """
+    from bullet_trade.core import orders as orders_module
+
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "fail_on_schedule_error": True,
+            "checkpoint_persistence_enabled": True,
+        },
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._startup_phase = "ready"
+    engine.broker = DummyBroker()
+    engine.async_scheduler = AsyncMock()
+    clear_order_queue()
+    set_current_engine(engine)
+
+    enqueue_entered = threading.Event()
+    release_enqueue = threading.Event()
+    late_result: Dict[str, Any] = {}
+    original_enqueue = orders_module._enqueue_order
+
+    def _controlled_enqueue(order_obj: Order) -> bool:
+        """在普通校验完成后暂停，等待调度失败门禁落盘。
+
+        Args:
+            order_obj: 已创建但尚未进入全局队列的订单。
+
+        Returns:
+            bool: 原子入队函数最终的接受或拒绝结果。
+
+        Side Effects:
+            设置 ``enqueue_entered`` 并等待 ``release_enqueue``。
+        """
+        enqueue_entered.set()
+        assert release_enqueue.wait(timeout=2)
+        return original_enqueue(order_obj)
+
+    monkeypatch.setattr(orders_module, "_enqueue_order", _controlled_enqueue)
+    worker: Optional[threading.Thread] = None
+
+    def _create_late_order(call_context: contextvars.Context) -> None:
+        """在复制的失败批次上下文中继续一笔迟到订单。
+
+        Args:
+            call_context: 从调度协程复制出的批次上下文。
+
+        Returns:
+            None。
+
+        Side Effects:
+            将订单或异常写入 ``late_result``。
+        """
+        try:
+            late_result["order"] = call_context.run(
+                order,
+                "000001.XSHE",
+                100,
+                10.0,
+            )
+        except BaseException as exc:
+            late_result["error"] = exc
+
+    async def _trigger(*_args, **_kwargs):
+        """启动迟到订单线程并立即返回失败回执。
+
+        Args:
+            *_args: 兼容 AsyncScheduler.trigger 的位置参数。
+            **_kwargs: 兼容 AsyncScheduler.trigger 的关键字参数。
+
+        Returns:
+            Dict[str, Dict[str, str]]: 固定失败调度回执。
+
+        Side Effects:
+            启动携带当前批次上下文的 worker 线程。
+        """
+        nonlocal worker
+        call_context = contextvars.copy_context()
+        worker = threading.Thread(
+            target=_create_late_order,
+            args=(call_context,),
+        )
+        worker.start()
+        assert enqueue_entered.wait(timeout=2)
+        return {"daily__failed": {"error": "task failed"}}
+
+    engine.async_scheduler.trigger.side_effect = _trigger
+    try:
+        with pytest.raises(RuntimeError, match="daily__failed"):
+            await engine._handle_minute_tick(datetime(2025, 1, 2, 9, 31))
+
+        release_enqueue.set()
+        worker.join(timeout=2)
+        assert worker.is_alive() is False
+        assert "error" not in late_result
+        late_order = late_result["order"]
+        assert late_order.status == OrderStatus.rejected
+        assert late_order.extra["rejection_reason"] == "scheduler_task_failed"
+        assert get_order_queue() == []
+        assert engine.broker.orders == []
+    finally:
+        release_enqueue.set()
+        if worker is not None:
+            worker.join(timeout=2)
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_waiting_order_processor_rechecks_batch_guard_after_lock(monkeypatch, tmp_path):
+    """验证已通过外层检查的等待协程拿到订单锁后仍会复检批次门禁。
+
+    Args:
+        monkeypatch: pytest 提供的临时属性替换工具。
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None。
+
+    Side Effects:
+        临时占用 LiveEngine 订单锁并修改批次状态，
+        结束时恢复全局测试状态。
+    """
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={"runtime_dir": str(tmp_path / "runtime")},
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._startup_phase = "ready"
+    engine.broker = DummyBroker()
+    engine._order_lock = asyncio.Lock()
+    clear_order_queue()
+    set_current_engine(engine)
+    monkeypatch.setattr(
+        "bullet_trade.core.orders._trigger_order_processing",
+        lambda _timeout: None,
+    )
+    queued = order("000001.XSHE", 100, price=10.0)
+    assert queued is not None
+
+    await engine._order_lock.acquire()
+    processor = asyncio.create_task(
+        engine._process_orders(datetime(2025, 1, 2, 9, 31))
+    )
+    await asyncio.sleep(0)
+    engine._schedule_batch_active = True
+    engine._order_lock.release()
+    try:
+        await processor
+
+        assert engine.broker.orders == []
+        assert get_order_queue() == [queued]
+    finally:
+        engine._schedule_batch_active = False
+        if engine._order_lock.locked():
+            engine._order_lock.release()
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_live_engine_schedule_error_default_keeps_existing_behavior(tmp_path, monkeypatch):
+    """验证默认未启用保护时仍保持原有的记录错误并推进游标语义。"""
+    strategy = _write_strategy(tmp_path)
+    scheduled = datetime(2025, 1, 2, 9, 31)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={"runtime_dir": str(tmp_path / "runtime")},
+    )
+    engine.async_scheduler = AsyncMock()
+    engine.async_scheduler.trigger.return_value = {
+        "daily__publish_09:31:00": {"error": "publish failed"}
+    }
+    engine._maybe_emit_market_events = AsyncMock()
+    engine._maybe_handle_data = AsyncMock()
+    engine._process_orders = AsyncMock()
+    persisted: list[datetime] = []
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.persist_scheduler_cursor",
+        lambda value: persisted.append(value),
+    )
+
+    await engine._handle_minute_tick(scheduled)
+
+    assert engine.config.fail_on_schedule_error is False
+    assert engine._last_schedule_dt == scheduled
+    assert persisted == [scheduled]
+
+
 @pytest.mark.asyncio
 async def test_live_engine_applies_scheduler_override_from_env(tmp_path):
     strategy = _write_strategy(tmp_path)
@@ -763,6 +2550,178 @@ async def test_handle_tick_hook_receives_context(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_live_engine_remote_provider_tick_contract(monkeypatch, tmp_path):
+    """验证 qmt-remote 单参数回调可完成订阅并注入 LiveEngine context。"""
+
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "g_autosave_enabled": False,
+            "account_sync_enabled": False,
+            "order_sync_enabled": False,
+            "tick_sync_enabled": False,
+            "risk_check_enabled": False,
+            "broker_heartbeat_interval": 0,
+        },
+    )
+    provider = object.__new__(RemoteQmtProvider)
+    provider._tick_callback = None
+    provider._tick_context = None
+    subscriptions = []
+
+    def _subscribe_ticks(symbols):
+        """记录 LiveEngine 同步给远程 provider 的证券列表。"""
+
+        subscriptions.append(list(symbols))
+        return {"ok": True}
+
+    provider.subscribe_ticks = _subscribe_ticks
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_data_provider",
+        lambda: provider,
+    )
+    loop = asyncio.get_running_loop()
+    engine._loop = loop
+    engine._market_callbacks_enabled = True
+    engine._tick_symbols.add("000001.XSHE")
+    received = {}
+    completed = asyncio.Event()
+
+    async def _handler(context, tick):
+        """记录策略最终收到的真实 LiveEngine context 与 tick。"""
+
+        received["context"] = context
+        received["tick"] = tick
+        completed.set()
+
+    engine.handle_tick_func = _handler
+
+    engine._sync_provider_subscription()
+    provider._handle_tick_event(
+        {"symbol": "000001.SZ", "lastPrice": 10.01, "time": "09:31:00"}
+    )
+    await asyncio.wait_for(completed.wait(), timeout=1)
+
+    assert subscriptions == [["000001.XSHE"]]
+    assert engine._provider_tick_callback_bound is True
+    assert received["context"] is engine.context
+    assert received["tick"] == {
+        "sid": "000001.XSHE",
+        "last_price": 10.01,
+        "dt": "09:31:00",
+    }
+
+
+@pytest.mark.asyncio
+async def test_process_orders_skips_risk_checks_when_disabled(monkeypatch, tmp_path):
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config=cfg,
+    )
+    loop = asyncio.get_running_loop()
+    engine._loop = loop
+    engine._order_lock = asyncio.Lock()
+    engine._stop_event = asyncio.Event()
+    engine.event_bus = EventBus(loop)
+    engine.async_scheduler = AsyncScheduler()
+    engine.broker = DummyBroker()
+    engine.context.portfolio.available_cash = 1_000
+    engine.context.portfolio.total_value = 1_000
+    assert engine._risk is None
+
+    class Snap:
+        paused = False
+        last_price = 10.0
+        high_limit = 10.5
+        low_limit = 9.5
+
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"159915.XSHE": Snap()}
+    )
+
+    clear_order_queue()
+    set_current_engine(engine)
+    try:
+        order("159915.XSHE", 100)
+        await engine._process_orders(engine.context.current_dt)
+    finally:
+        set_current_engine(None)
+
+    assert len(engine.broker.orders) == 1
+    security, amount, _, side, market = engine.broker.orders[0]
+    assert (security, amount, side, market) == ("159915.XSHE", 100, "buy", True)
+
+
+@pytest.mark.asyncio
+async def test_process_orders_rejects_buy_below_min_value_when_risk_enabled(monkeypatch, tmp_path):
+    """测试实盘风控开启后会拒绝低于最小金额的买入委托。"""
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config=cfg,
+    )
+    engine.broker = DummyBroker()
+    engine.context.portfolio.available_cash = 10_000
+    engine.context.portfolio.total_value = 10_000
+    engine._risk = RiskController(
+        config={
+            "max_order_value": 100_000,
+            "max_daily_trade_value": 500_000,
+            "max_daily_trades": 100,
+            "max_daily_cancels": 100,
+            "min_cancel_interval_seconds": 0.0,
+            "max_cancel_per_order": 3,
+            "min_buy_order_value": 2_000.0,
+            "max_stock_count": 20,
+            "max_position_ratio": 100.0,
+            "stop_loss_ratio": 5.0,
+        }
+    )
+
+    class Snap:
+        paused = False
+        last_price = 10.0
+        high_limit = 10.5
+        low_limit = 9.5
+
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"159915.XSHE": Snap()}
+    )
+
+    clear_order_queue()
+    order_obj = order("159915.XSHE", 100)
+
+    await engine._process_orders(engine.context.current_dt)
+
+    assert len(engine.broker.orders) == 0
+    assert order_obj.status == OrderStatus.rejected
+
+
+@pytest.mark.asyncio
 async def test_market_flag_propagates_to_broker(monkeypatch, tmp_path):
     strategy = _write_strategy(tmp_path)
     cfg = {
@@ -790,7 +2749,9 @@ async def test_market_flag_propagates_to_broker(monkeypatch, tmp_path):
         high_limit = 10.5
         low_limit = 9.5
 
-    monkeypatch.setattr("bullet_trade.core.live_engine.get_current_data", lambda: {"000001.XSHE": Snap()})
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"000001.XSHE": Snap()}
+    )
 
     clear_order_queue()
     order("000001.XSHE", 100)
@@ -802,7 +2763,9 @@ async def test_market_flag_propagates_to_broker(monkeypatch, tmp_path):
 
     sec1, amt1, price1, side1, market1 = engine.broker.orders[0]
     assert (sec1, amt1, side1, market1) == ("000001.XSHE", 100, "buy", True)
-    expected_price = pricing.compute_market_protect_price("000001.XSHE", 10.0, 10.5, 9.5, 0.015, True)
+    expected_price = pricing.compute_market_protect_price(
+        "000001.XSHE", 10.0, 10.5, 9.5, 0.015, True
+    )
     assert price1 == pytest.approx(expected_price)
 
     sec2, amt2, price2, side2, market2 = engine.broker.orders[1]
@@ -880,6 +2843,602 @@ def test_get_orders_from_broker_includes_external_snapshots(tmp_path):
     assert set(target_order.keys()) == {"B2"}
 
 
+def test_live_engine_get_open_orders_includes_submitted_string_status(tmp_path):
+    """submitted 字符串状态应被视为 live 在途订单。"""
+
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config=cfg,
+    )
+    local_order = Order(
+        order_id="submitted-1",
+        security="000001.XSHE",
+        amount=100,
+        status="submitted",
+        is_buy=True,
+    )
+    engine._orders[local_order.order_id] = local_order
+
+    open_orders = engine.get_open_orders()
+
+    assert "submitted-1" in open_orders
+
+
+def test_apply_order_snapshots_prefers_filled_price_over_order_price(tmp_path):
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config=cfg,
+    )
+    local_order = Order(
+        order_id="local-1",
+        security="159915.XSHE",
+        amount=100,
+        price=3.247,
+        status=OrderStatus.open,
+        is_buy=True,
+    )
+    engine._orders[local_order.order_id] = local_order
+    engine._broker_order_index["B1"] = local_order.order_id
+
+    engine._apply_order_snapshots(
+        [
+            {
+                "order_id": "B1",
+                "security": "159915.XSHE",
+                "status": "filled",
+                "amount": 100,
+                "filled_amount": 100,
+                "price": 3.247,
+                "avg_cost": 3.231,
+                "order_price": 3.247,
+            }
+        ]
+    )
+
+    assert local_order.filled == 100
+    assert local_order.price == pytest.approx(3.231)
+    assert local_order.extra["order_price"] == pytest.approx(3.247)
+
+
+def test_apply_order_snapshots_preserves_requested_market_price_when_broker_reports_different_order_price(
+    tmp_path,
+):
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=str(strategy),
+        broker_factory=DummyBroker,
+        live_config=cfg,
+    )
+    local_order = Order(
+        order_id="local-1",
+        security="159967.XSHE",
+        amount=1000,
+        price=0.0,
+        status=OrderStatus.open,
+        is_buy=False,
+        style=MarketOrderStyle(),
+        extra={"order_price": 0.626, "requested_order_price": 0.626},
+    )
+    engine._orders[local_order.order_id] = local_order
+    engine._broker_order_index["B1"] = local_order.order_id
+
+    engine._apply_order_snapshots(
+        [
+            {
+                "order_id": "B1",
+                "security": "159967.XSHE",
+                "status": "filled",
+                "amount": 1000,
+                "filled_amount": 1000,
+                "price": 0.634,
+                "avg_cost": 0.634,
+                "order_price": 0.634,
+                "style_type": "market",
+            }
+        ]
+    )
+
+    assert local_order.price == pytest.approx(0.634)
+    assert local_order.extra["order_price"] == pytest.approx(0.626)
+    assert local_order.extra["requested_order_price"] == pytest.approx(0.626)
+    assert local_order.extra["broker_order_price"] == pytest.approx(0.634)
+
+
+def test_apply_order_snapshots_preserves_settlement_state_fields(tmp_path):
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config=cfg,
+    )
+    local_order = Order(
+        order_id="local-1",
+        security="127085.XSHE",
+        amount=750,
+        price=130.881,
+        status=OrderStatus.open,
+        is_buy=True,
+    )
+    engine._orders[local_order.order_id] = local_order
+    engine._broker_order_index["B1"] = local_order.order_id
+
+    engine._apply_order_snapshots(
+        [
+            {
+                "order_id": "B1",
+                "security": "127085.XSHE",
+                "status": "canceled",
+                "amount": 750,
+                "filled_amount": 0,
+                "order_price": 130.881,
+                "settlement_state": "pending",
+                "settlement_pending_reason": "[pending_settlement] filled_amount=750 缺少可信 traded_price/deal_balance",
+            }
+        ]
+    )
+
+    assert local_order.extra["settlement_state"] == "pending"
+    assert "pending_settlement" in local_order.extra["settlement_pending_reason"]
+
+
+def test_apply_order_snapshots_debug_logs_only_on_signature_change(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("BT_LIVE_ORDER_DEBUG", "1")
+    caplog.set_level("INFO", logger="jq_strategy")
+
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config=cfg,
+    )
+    local_order = Order(
+        order_id="local-1",
+        security="159915.XSHE",
+        amount=100,
+        price=3.247,
+        status=OrderStatus.open,
+        is_buy=True,
+    )
+    engine._orders[local_order.order_id] = local_order
+    engine._broker_order_index["B1"] = local_order.order_id
+
+    snapshot = {
+        "order_id": "B1",
+        "security": "159915.XSHE",
+        "status": "filled",
+        "amount": 100,
+        "filled_amount": 100,
+        "price": 3.247,
+        "avg_cost": 3.231,
+        "order_price": 3.247,
+    }
+    engine._apply_order_snapshots([snapshot])
+    engine._apply_order_snapshots([dict(snapshot)])
+    engine._apply_order_snapshots([{**snapshot, "order_price": 3.248}])
+
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "[ORDER_DEBUG] live.apply_order_snapshot" in record.getMessage()
+    ]
+    assert len(lines) == 2
+    assert "order_price': 3.247" in lines[0]
+    assert "order_price': 3.248" in lines[1]
+
+
+@pytest.mark.asyncio
+async def test_process_orders_reconciles_limit_buy_avg_cost_from_trades(monkeypatch, tmp_path):
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=lambda: FillAwareBroker(fill_price=3.231),
+        live_config=cfg,
+    )
+    loop = asyncio.get_running_loop()
+    engine._loop = loop
+    engine._order_lock = asyncio.Lock()
+    engine._stop_event = asyncio.Event()
+    engine.event_bus = EventBus(loop)
+    engine.async_scheduler = AsyncScheduler()
+    engine.broker = FillAwareBroker(fill_price=3.231)
+    engine._risk = None
+    engine.context.portfolio.available_cash = 100000.0
+    engine.context.portfolio.total_value = 100000.0
+    set_current_engine(engine)
+
+    class Snap:
+        paused = False
+        last_price = 3.231
+        high_limit = 3.500
+        low_limit = 3.000
+
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"159915.XSHE": Snap()}
+    )
+
+    clear_order_queue()
+    await asyncio.to_thread(order, "159915.XSHE", 30700, LimitOrderStyle(3.247))
+
+    position = engine.context.portfolio.positions["159915.XSHE"]
+    assert position.total_amount == 30700
+    assert position.avg_cost == pytest.approx(3.231)
+    assert engine.context.portfolio.available_cash == pytest.approx(100000.0 - 30700 * 3.247)
+    set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_process_orders_reconciles_market_buy_avg_cost_from_trades(monkeypatch, tmp_path):
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+        "market_buy_price_percent": 0.015,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=lambda: FillAwareBroker(fill_price=3.231),
+        live_config=cfg,
+    )
+    loop = asyncio.get_running_loop()
+    engine._loop = loop
+    engine._order_lock = asyncio.Lock()
+    engine._stop_event = asyncio.Event()
+    engine.event_bus = EventBus(loop)
+    engine.async_scheduler = AsyncScheduler()
+    engine.broker = FillAwareBroker(fill_price=3.231)
+    engine._risk = None
+    engine.context.portfolio.available_cash = 100000.0
+    engine.context.portfolio.total_value = 100000.0
+    set_current_engine(engine)
+
+    class Snap:
+        paused = False
+        last_price = 3.231
+        high_limit = 3.500
+        low_limit = 3.000
+
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"159915.XSHE": Snap()}
+    )
+    monkeypatch.setattr(pricing, "compute_market_protect_price", lambda *args, **kwargs: 3.279)
+
+    clear_order_queue()
+    await asyncio.to_thread(order, "159915.XSHE", 30700, MarketOrderStyle())
+
+    position = engine.context.portfolio.positions["159915.XSHE"]
+    assert position.total_amount == 30700
+    assert position.avg_cost == pytest.approx(3.231)
+    assert engine.broker.submitted_market is True
+    assert engine.broker.submitted_price == pytest.approx(3.279)
+    set_current_engine(None)
+
+
+def test_apply_account_snapshot_preserves_v2_locked_cash_and_stock_subportfolio(tmp_path):
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config=cfg,
+    )
+
+    engine._apply_account_snapshot(
+        {
+            "available_cash": 317.10,
+            "transferable_cash": 317.10,
+            "locked_cash": 491.20,
+            "total_value": 100000.0,
+            "positions": [
+                {
+                    "security": "159915.XSHE",
+                    "amount": 30700,
+                    "closeable_amount": 0,
+                    "avg_cost": 3.231,
+                    "current_price": 3.231,
+                    "market_value": 99191.7,
+                }
+            ],
+        }
+    )
+
+    portfolio = engine.context.portfolio
+    assert portfolio.available_cash == pytest.approx(317.10)
+    assert portfolio.transferable_cash == pytest.approx(317.10)
+    assert portfolio.locked_cash == pytest.approx(491.20)
+    assert portfolio.total_value == pytest.approx(100000.0)
+    assert portfolio.positions["159915.XSHE"].closeable_amount == 0
+    stock_sub = portfolio.subportfolios["stock"]
+    assert stock_sub.available_cash == pytest.approx(317.10)
+    assert stock_sub.transferable_cash == pytest.approx(317.10)
+    assert stock_sub.positions["159915.XSHE"].total_amount == 30700
+
+
+@pytest.mark.asyncio
+async def test_live_engine_v2_rejected_order_releases_locked_cash(monkeypatch, tmp_path):
+    client = SequencedV2Client(
+        {
+            "broker.place_order": [
+                {"order_id": "v2-B1"},
+            ],
+            "broker.orders": [
+                [
+                    {
+                        "order_id": "v2-B1",
+                        "security": "159915.SZ",
+                        "side": "BUY",
+                        "amount": 100,
+                        "filled": 0,
+                        "status": "open",
+                        "style": {"type": "limit", "price": 3.247},
+                    }
+                ],
+                [
+                    {
+                        "order_id": "v2-B1",
+                        "security": "159915.SZ",
+                        "side": "BUY",
+                        "amount": 100,
+                        "filled": 0,
+                        "status": "rejected",
+                        "raw_status": 57,
+                        "style": {"type": "limit", "price": 3.247},
+                    }
+                ],
+            ],
+            "broker.trades": [
+                [],
+            ],
+            "broker.account": [
+                {
+                    "available_cash": 100000.0,
+                    "transferable_cash": 100000.0,
+                    "frozen_cash": 0.0,
+                    "total_asset": 100000.0,
+                },
+                {
+                    "available_cash": 99675.3,
+                    "transferable_cash": 99675.3,
+                    "frozen_cash": 324.7,
+                    "total_asset": 100000.0,
+                },
+                {
+                    "available_cash": 100000.0,
+                    "transferable_cash": 100000.0,
+                    "frozen_cash": 0.0,
+                    "total_asset": 100000.0,
+                },
+            ],
+            "broker.positions": [
+                [],
+                [],
+                [],
+            ],
+        }
+    )
+    broker = _build_v2_broker(client)
+    engine = _build_v2_live_engine(tmp_path, broker)
+    _prime_live_engine(engine, broker)
+    set_current_engine(engine)
+
+    class Snap:
+        paused = False
+        last_price = 3.231
+        high_limit = 3.500
+        low_limit = 3.000
+
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"159915.SZ": Snap()}
+    )
+    clear_order_queue()
+    try:
+        order_obj = await asyncio.to_thread(order, "159915.SZ", 100, LimitOrderStyle(3.247))
+        assert order_obj is not None
+        backing = engine.portfolio_proxy.backing
+        assert backing.available_cash == pytest.approx(99675.3)
+        assert backing.locked_cash == pytest.approx(324.7)
+        assert backing.total_value == pytest.approx(100000.0)
+
+        await engine._order_sync_step()
+        await engine._account_sync_step()
+
+        assert order_obj.status == OrderStatus.rejected
+        assert backing.available_cash == pytest.approx(100000.0)
+        assert backing.locked_cash == pytest.approx(0.0)
+        assert backing.total_value == pytest.approx(100000.0)
+        assert backing.positions == {}
+    finally:
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_live_engine_v2_partial_fill_updates_cash_locked_and_positions(monkeypatch, tmp_path):
+    client = SequencedV2Client(
+        {
+            "broker.place_order": [
+                {"order_id": "v2-B2"},
+            ],
+            "broker.orders": [
+                [
+                    {
+                        "order_id": "v2-B2",
+                        "security": "159915.SZ",
+                        "side": "BUY",
+                        "amount": 30700,
+                        "filled": 0,
+                        "status": "open",
+                        "style": {"type": "limit", "price": 3.247},
+                    }
+                ],
+                [
+                    {
+                        "order_id": "v2-B2",
+                        "security": "159915.SZ",
+                        "side": "BUY",
+                        "amount": 30700,
+                        "filled": 15100,
+                        "status": "partial_filled",
+                        "avg_cost": 3.231,
+                        "deal_balance": 48788.1,
+                        "style": {"type": "limit", "price": 3.247},
+                    }
+                ],
+            ],
+            "broker.trades": [
+                [],
+            ],
+            "broker.account": [
+                {
+                    "available_cash": 100000.0,
+                    "transferable_cash": 100000.0,
+                    "frozen_cash": 0.0,
+                    "total_asset": 100000.0,
+                },
+                {
+                    "available_cash": 317.1,
+                    "transferable_cash": 317.1,
+                    "frozen_cash": 99682.9,
+                    "total_asset": 100000.0,
+                },
+                {
+                    "available_cash": 558.7,
+                    "transferable_cash": 558.7,
+                    "frozen_cash": 50653.2,
+                    "total_asset": 100000.0,
+                },
+            ],
+            "broker.positions": [
+                [],
+                [],
+                [
+                    {
+                        "security": "159915.SZ",
+                        "amount": 15100,
+                        "available_amount": 0,
+                        "closeable_amount": 0,
+                        "avg_cost": 3.231,
+                        "last_price": 3.231,
+                        "position_value": 48788.1,
+                    }
+                ],
+            ],
+        }
+    )
+    broker = _build_v2_broker(client)
+    engine = _build_v2_live_engine(tmp_path, broker)
+    _prime_live_engine(engine, broker)
+    set_current_engine(engine)
+
+    class Snap:
+        paused = False
+        last_price = 3.231
+        high_limit = 3.500
+        low_limit = 3.000
+
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"159915.SZ": Snap()}
+    )
+    clear_order_queue()
+    try:
+        order_obj = await asyncio.to_thread(order, "159915.SZ", 30700, LimitOrderStyle(3.247))
+        assert order_obj is not None
+        backing = engine.portfolio_proxy.backing
+        assert backing.available_cash == pytest.approx(317.1)
+        assert backing.locked_cash == pytest.approx(99682.9)
+        assert backing.total_value == pytest.approx(100000.0)
+
+        await engine._order_sync_step()
+        await engine._account_sync_step()
+
+        assert order_obj.status == OrderStatus.filling
+        assert order_obj.filled == 15100
+        assert order_obj.price == pytest.approx(3.231)
+        assert backing.available_cash == pytest.approx(558.7)
+        assert backing.locked_cash == pytest.approx(50653.2)
+        assert backing.total_value == pytest.approx(100000.0)
+        position = backing.positions["159915.SZ"]
+        assert position.total_amount == 15100
+        assert position.closeable_amount == 0
+        assert position.avg_cost == pytest.approx(3.231)
+        stock_sub = backing.subportfolios["stock"]
+        assert stock_sub.available_cash == pytest.approx(558.7)
+        assert stock_sub.positions["159915.SZ"].total_amount == 15100
+    finally:
+        clear_order_queue()
+        set_current_engine(None)
+
+
 @pytest.mark.asyncio
 async def test_process_orders_runs_once_with_lock(monkeypatch, tmp_path):
     strategy = _write_strategy(tmp_path)
@@ -915,7 +3474,9 @@ async def test_process_orders_runs_once_with_lock(monkeypatch, tmp_path):
         high_limit = 10.5
         low_limit = 9.5
 
-    monkeypatch.setattr("bullet_trade.core.live_engine.get_current_data", lambda: {"000001.XSHE": Snap()})
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"000001.XSHE": Snap()}
+    )
 
     clear_order_queue()
     order("000001.XSHE", 100, wait_timeout=0)
@@ -991,7 +3552,9 @@ async def test_order_waits_until_processed(monkeypatch, tmp_path):
         high_limit = 10.5
         low_limit = 9.5
 
-    monkeypatch.setattr("bullet_trade.core.live_engine.get_current_data", lambda: {"000001.XSHE": Snap()})
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"000001.XSHE": Snap()}
+    )
 
     clear_order_queue()
 
@@ -1026,3 +3589,93 @@ def test_live_engine_run_returns_nonzero_on_error(tmp_path, monkeypatch, caplog)
     exit_code = engine.run()
     assert exit_code == 2
     assert "missing xtquant" in caplog.text
+
+
+def test_dummy_broker_lifecycle_hooks_default_to_noop():
+    broker = DummyBroker()
+
+    assert broker.before_open() is None
+    assert broker.after_close() is None
+
+
+@pytest.mark.asyncio
+async def test_live_engine_triggers_broker_lifecycle_hooks_at_safe_markers(tmp_path):
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=LifecycleBroker,
+        live_config={"runtime_dir": str(tmp_path / "runtime")},
+    )
+    broker = LifecycleBroker()
+    engine._loop = asyncio.get_running_loop()
+    engine.event_bus = EventBus(engine._loop)
+    engine.broker = broker
+    engine.context.portfolio.total_value = 1_000_000
+    current_day = date(2026, 4, 3)
+    engine._pre_open_dt = datetime.combine(current_day, Time(9, 0))
+    engine._open_dt = datetime.combine(current_day, Time(9, 30))
+    engine._close_dt = datetime.combine(current_day, Time(15, 0))
+    engine._post_close_dt = datetime.combine(current_day, Time(15, 31))
+
+    await engine._maybe_emit_market_events(datetime.combine(current_day, Time(9, 0)))
+    await engine._maybe_emit_market_events(datetime.combine(current_day, Time(15, 31)))
+
+    assert broker.before_open_calls == 1
+    assert broker.after_close_calls == 1
+
+
+def test_live_engine_apply_account_snapshot_sets_position_buy_times(tmp_path):
+    engine = _build_v2_live_engine(tmp_path, DummyBroker())
+    target = (
+        engine.portfolio_proxy.backing
+        if isinstance(engine.context.portfolio, LivePortfolioProxy)
+        else engine.context.portfolio
+    )
+
+    engine._apply_account_snapshot(
+        {
+            "available_cash": 452.0,
+            "total_value": 20097.2,
+            "positions": [
+                {
+                    "security": "159915.XSHE",
+                    "amount": 5400,
+                    "closeable_amount": 0,
+                    "avg_cost": 3.620,
+                    "current_price": 3.634,
+                    "market_value": 19623.6,
+                    "init_time": "2026-04-21T09:40:00",
+                    "transact_time": "2026-04-21T10:36:00",
+                }
+            ],
+        }
+    )
+
+    position = target.positions["159915.XSHE"]
+    assert position.buy_time == datetime(2026, 4, 21, 9, 40, 0)
+    assert position.last_buy_time == datetime(2026, 4, 21, 10, 36, 0)
+
+
+@pytest.mark.asyncio
+async def test_live_engine_does_not_backfill_broker_before_open_after_market_open(tmp_path):
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=LifecycleBroker,
+        live_config={"runtime_dir": str(tmp_path / "runtime")},
+    )
+    broker = LifecycleBroker()
+    engine._loop = asyncio.get_running_loop()
+    engine.event_bus = EventBus(engine._loop)
+    engine.broker = broker
+    engine.context.portfolio.total_value = 1_000_000
+    current_day = date(2026, 4, 3)
+    engine._pre_open_dt = datetime.combine(current_day, Time(9, 0))
+    engine._open_dt = datetime.combine(current_day, Time(9, 30))
+    engine._close_dt = datetime.combine(current_day, Time(15, 0))
+    engine._post_close_dt = datetime.combine(current_day, Time(15, 31))
+
+    await engine._maybe_emit_market_events(datetime.combine(current_day, Time(14, 0)))
+
+    assert broker.before_open_calls == 0
+    assert broker.after_close_calls == 0

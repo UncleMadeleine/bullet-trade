@@ -1,109 +1,324 @@
-# 配置总览（回测/实盘/远程）
+# 配置总览
 
-统一列出常用环境变量，避免在多页面重复。按照场景分组，可结合 `.env` 模板使用。
+这是一份按需查询的完整参考，不要求新用户复制全部配置。当前推荐的大 QMT 首次接入只需要三个服务端值；完成后即可停止阅读本页。
 
-> 若需显式指定 `.env` 文件，可设置 `BT_ENV_FILE` / `BULLET_TRADE_ENV_FILE` / `ENV_FILE`，优先级高于自动向上查找。
+```env
+QMT_SERVER_TOKEN=请生成一个新的客户端令牌
+QMT_ACCOUNT_ID=你的QMT资金账号
+BIG_QMT_GATEWAY_PASSWORD=与helper顶部完全一致
+```
 
-## 通用
-| 变量 | 必填 | 示例/默认 | 作用 |
-| --- | --- | --- | --- |
-| `BT_ENV_FILE`/`BULLET_TRADE_ENV_FILE`/`ENV_FILE` | 否 | `./.env.live` | 指定要加载的 `.env` 路径，覆盖默认的向上查找逻辑 |
-| `DEFAULT_DATA_PROVIDER` | 否 | `jqdata` | 默认行情源，回测/实盘共用（`jqdata`/`tushare`/`myquant`/`qmt`） |
-| `DEFAULT_BROKER` | 否 | `qmt` | 默认券商/交易通道（`simulator`/`qmt`/`qmt-remote`） |
-| `DATA_CACHE_DIR` | 否 | `~/.bullet-trade/cache` | 行情缓存根目录，子目录按数据源名自动创建；留空禁用缓存 |
-| `LOG_DIR` | 否 | `logs` | 日志目录 |
-| `LOG_LEVEL` | 否 | `INFO` | 控制台日志级别（`DEBUG`/`INFO`/`WARNING`/`ERROR`） |
-| `LOG_FILE_LEVEL` | 否 | 跟随 `LOG_LEVEL` | 文件日志级别，未设置则与 `LOG_LEVEL` 相同 |
-| `RUNTIME_DIR` | 否 | `runtime` | 运行态/持久化目录（含 g.pkl、live_state.json） |
+聚宽策略只填写 `host` 和 `token`；本地策略可直接复用这份 `.env.bigqmt`。完整步骤见 [大 QMT：两种接入方式](big-qmt-server.md)。
 
-## 回测
-| 变量 | 必填 | 示例/默认 | 作用 |
-| --- | --- | --- | --- |
-| `DEFAULT_DATA_PROVIDER` | 是 | `jqdata` | 回测行情源 |
-| `JQDATA_USERNAME`/`JQDATA_PASSWORD` | 视数据源 | `your_user`/`your_pwd` | 聚宽数据账号 |
-| `JQDATA_SERVER`/`JQDATA_PORT` | 否 | `srv`/`8087` | 聚宽网关的地址/端口，不填则使用官方默认 |
-| `TUSHARE_TOKEN` | 选 | `your_token` | 需 `tushare` 时配置 |
-| `TUSHARE_CUSTOM_URL` | 否 | `http://127.0.0.1:port` | Tushare 自定义接入点 |
-| `MYQUANT_TOKEN` | 选 | `your_token` | 掘金量化 token，需在掘金平台申请 |
-| `MYQUANT_SERVER` | 否 | `localhost` | 自定义掘金终端地址（如本地运行终端） |
-| `MYQUANT_PORT` | 否 | `7070` | 自定义掘金终端端口 |
-| `MINIQMT_MARKET` | 否 | `SH` | MiniQMT 行情源的市场代码（交易日/数据过滤），默认上交所 |
+其余内容分两层：
 
-## 本地实盘（QMT/模拟）
-| 变量 | 必填 | 示例/默认 | 作用 |
-| --- | --- | --- | --- |
-| `DEFAULT_BROKER` | 是 | `qmt` 或 `simulator` | 交易通道 |
-| `QMT_DATA_PATH` | 是 | `C:\国金QMT交易端\userdata_mini` | xtquant 数据目录 |
-| `QMT_ACCOUNT_ID` | 是 | `123456` | QMT 账户 |
-| `QMT_ACCOUNT_TYPE` | 否 | `stock` | 账户类型 |
-| `MINIQMT_AUTO_DOWNLOAD` | 否 | `true` | 自动下载 MiniQMT |
-| `QMT_SESSION_ID` | 否 | `0` | 会话 ID，可选 |
-| `QMT_AUTO_SUBSCRIBE` | 否 | `true` | 连接 QMT 时是否自动订阅账户 |
-| `SIMULATOR_INITIAL_CASH` | 否 | `1000000` | 模拟器初始资金（`simulator` 券商） |
-| `MINIQMT_MARKET` | 否 | `SH` | 本地 MiniQMT 行情的市场代码 |
+- 前半部分是**最小可跑配置**，新机器先按这里配通。
+- 后半部分是**当前代码仍然生效的完整配置索引**。有默认值的不一定要写进 `.env`，但文档里必须能查到。
 
-## 下单手数规则（security_overrides.json）
-下单的最小手数与步进规则通过 `bullet_trade/config/security_overrides.json` 的 `lot_rules` 配置统一管理：
-- `default`：默认规则（例如 A 股 100 股/100 股步进）
-- `by_market`：按市场覆盖（北交所 `BJ`，兼容 `.BJ/.BSE`）
-- `by_prefix`：按代码前缀覆盖（如科创板 `68`、可转债 `110/113/118/123/127/128`）
-- `by_code`：单标覆盖
+没有列入这里的旧变量，通常表示当前代码没有读取，或者只是某个示例脚本里的 Python 常量，不再作为通用 `.env` 配置入口。
 
-规则匹配时兼容聚宽后缀（`.XSHG/.XSHE`）与 QMT/Tushare 后缀（`.SH/.SZ`、`.BJ/.BSE`）。
+## 1. MiniQMT 本地直连配置（兼容方案）
 
-## 风控（实盘）
-| 变量 | 必填 | 示例/默认 | 作用 |
-| --- | --- | --- | --- |
-| `MAX_ORDER_VALUE` | 否 | `100000` | 单笔订单金额上限，超出直接拒单。 |
-| `MAX_DAILY_TRADE_VALUE` | 否 | `500000` | 单日累计成交金额上限，超出直接拒单。 |
-| `MAX_DAILY_TRADES` | 否 | `100` | 单日最大交易笔数，超出直接拒单。 |
-| `MAX_DAILY_CANCELS` | 否 | `100` | 单日最大撤单次数，超出直接拒绝撤单。 |
-| `MIN_CANCEL_INTERVAL_SECONDS` | 否 | `0` | 两次撤单之间的最小间隔秒数，用于拦截撤单风暴。 |
-| `MAX_CANCEL_PER_ORDER` | 否 | `3` | 单笔订单允许的最大撤单尝试次数。 |
-| `MAX_STOCK_COUNT` | 否 | `20` | 最大持仓标的数（仅买入检查）。 |
-| `MAX_POSITION_RATIO` | 否 | `20` | 单标下单金额占总资产上限，需要在风控检查时提供账户总资产才会生效。 |
-| `STOP_LOSS_RATIO` | 否 | `5` | 止损阈值，供 `check_stop_loss` 辅助判断，需策略自行下撤单。 |
-| `RISK_CHECK_ENABLED` | 否 | `false` | 后台风控巡检开关，间隔由 `RISK_CHECK_INTERVAL` 控制（默认 `300` 秒）。 |
-| `RISK_CHECK_INTERVAL` | 否 | `300` | 风控后台巡检间隔（秒），仅 `RISK_CHECK_ENABLED=true` 时生效。 |
+适用场景：券商仍提供 MiniQMT/xtquant，且策略和 QMT 在同一台 Windows 机器上运行。新用户优先选择上面的大 QMT 路线。
 
-## 远程实盘（qmt-remote）
-| 变量 | 必填 | 示例/默认 | 作用 |
-| --- | --- | --- | --- |
-| `DEFAULT_BROKER` | 是 | `qmt-remote` | 远程通道 |
-| `QMT_SERVER_HOST`/`QMT_SERVER_PORT` | 是 | `10.0.0.8`/`58620` | 远程服务地址 |
-| `QMT_SERVER_TOKEN` | 是 | `secret` | 访问令牌 |
-| `QMT_SERVER_ACCOUNT_KEY` | 否 | `main` | 多账户时指定 |
-| `QMT_SERVER_SUB_ACCOUNT` | 否 | `demo@main` | 远程子账户标识，用于账户路由 |
-| `QMT_SERVER_SUB_ACCOUNTS` | 否 | `demo@main:limit=50000` | server 侧子账户映射与单笔额度限制。 |
-| `QMT_SERVER_ORDER_RISK_ENABLED` | 否 | `false` | 对 `broker.place_order` 与 `broker.cancel_order` 开启服务端风控，复用 `MAX_*` 与撤单限频参数。 |
-| `QMT_SERVER_IDEMPOTENCY_TTL_SECONDS` | 否 | `300` | `broker.place_order` 幂等缓存窗口，避免链路重试导致重复下单。 |
-| `QMT_SERVER_TLS_CERT` | 否 | `/path/to/ca.pem` | 启用 TLS 校验时的证书路径 |
+这是 MiniQMT/xtquant 直连模式，依赖 `QMT_DATA_PATH` 指向 `userdata_mini`。大 QMT 不能直接使用这组配置；大 QMT 先按 [大 QMT 服务向导](big-qmt-server.md) 启动 helper 和 `--server-type big_qmt`，策略侧再使用第 3 节的 `qmt-remote`。
 
-## 聚宽模拟盘接入远程实盘
-| 变量 | 必填 | 示例/默认 | 作用 |
-| --- | --- | --- | --- |
-| `BT_REMOTE_HOST`/`BT_REMOTE_PORT` | 是 | `10.0.0.8`/`58620` | 远程 QMT server |
-| `BT_REMOTE_TOKEN` | 是 | `secret` | 访问令牌 |
-| `ACCOUNT_KEY`/`SUB_ACCOUNT` | 视账户 | `main`/`子账户` | 选填，匹配远程账户 |
+命名关系：
 
-## 实盘运行参数（LiveEngine）
-| 变量 | 必填 | 示例/默认 | 作用 |
-| --- | --- | --- | --- |
-| `ORDER_MAX_VOLUME` | 否 | `1000000` | 单笔委托最大股数，超出自动拆单 |
-| `TRADE_MAX_WAIT_TIME` | 否 | `16` | 同步下单/撤单等待秒数（<=0 走异步立即返回） |
-| `EVENT_TIME_OUT` | 否 | `60` | 调度事件超时时间，延迟超过则丢弃当次事件 |
-| `STRATEGY_NAME` | 否 | `demo-strategy` | 实盘订单备注中的策略标识，便于多策略并行排查；未设置时使用策略文件名 |
-| `SCHEDULER_MARKET_PERIODS` | 否 | `09:30-11:30,13:00-15:00` | 自定义交易时段（期货/夜盘调试） |
-| `ACCOUNT_SYNC_ENABLED`/`ACCOUNT_SYNC_INTERVAL` | 否 | `true`/`60` | 账户快照后台同步开关与间隔（秒） |
-| `ORDER_SYNC_ENABLED`/`ORDER_SYNC_INTERVAL` | 否 | `true`/`10` | 订单状态轮询开关与间隔（秒） |
-| `G_AUTOSAVE_ENABLED`/`G_AUTOSAVE_INTERVAL` | 否 | `true`/`60` | `g` 状态自动保存开关与间隔（秒） |
-| `TICK_SUBSCRIPTION_LIMIT` | 否 | `100` | Tick 订阅标的数量上限 |
-| `TICK_SYNC_ENABLED`/`TICK_SYNC_INTERVAL` | 否 | `true`/`2` | 无推送时的 Tick 轮询开关与间隔（秒） |
-| `CALENDAR_SKIP_WEEKEND`/`CALENDAR_RETRY_MINUTES` | 否 | `true`/`1` | 非交易日检测：周末是否跳过、下一次检查间隔（分钟） |
-| `BROKER_HEARTBEAT_INTERVAL` | 否 | `30` | 券商心跳后台任务间隔（秒，<=0 关闭） |
-| `PORTFOLIO_REFRESH_THROTTLE_MS` | 否 | `200` | 访问实时持仓/资金前的最小刷新间隔（毫秒），防止高频刷接口 |
-| `MARKET_BUY_PRICE_PERCENT`/`MARKET_SELL_PRICE_PERCENT` | 否 | `0.015`/`-0.015` | 市价单保护价偏移比例（正=买高、负=卖低，默认 ±1.5%） |
+| 名称 | 含义 |
+|------|------|
+| `qmt` | MiniQMT/xtquant 本地直连 provider/broker |
+| `big_qmt` | 大 QMT server 后端 |
+| `qmt-remote` | 客户端远程 provider/broker，实际后端可能是 MiniQMT 或大 QMT |
 
-> 备注：实盘下单会生成 `bt:<strategy>:<shortid>` 格式的订单备注（仅 ASCII，<=24 字符），其中 `<strategy>` 优先使用 `STRATEGY_NAME`，未设置则取策略文件名短名。
+```env
+DEFAULT_DATA_PROVIDER=qmt
+DEFAULT_BROKER=qmt
+QMT_DATA_PATH=C:\国金QMT交易端\userdata_mini
+QMT_ACCOUNT_ID=123456
+```
 
-> 提示：敏感信息不要入库，按需覆盖到本地 `.env`。***
+运行：
+
+```bash
+bullet-trade live strategies/demo_strategy.py --broker qmt
+```
+
+补充：
+
+- 股票账户默认就是 `stock`，所以 `QMT_ACCOUNT_TYPE` 不用写。
+- 只有期货账户才需要写 `QMT_ACCOUNT_TYPE=future`。
+
+## 2. 远程 server 最小配置
+
+适用场景：Windows 机器只负责连 QMT，对外提供远程行情和交易服务。
+
+下面是 MiniQMT 后端的远程 server 配置。大 QMT 后端使用 `BIG_QMT_GATEWAY_URL`、`BIG_QMT_GATEWAY_PASSWORD` 和 `--server-type big_qmt`，见 [大 QMT 服务向导](big-qmt-server.md)。
+
+```env
+QMT_DATA_PATH=C:\国金QMT交易端\userdata_mini
+QMT_ACCOUNT_ID=123456
+QMT_SERVER_TOKEN=secret
+```
+
+运行：
+
+```bash
+bullet-trade --env-file .env server --listen 0.0.0.0 --port 58620 --enable-data --enable-broker
+```
+
+补充：
+
+- 当前版本不支持 `--data-path`。
+- `QMT_DATA_PATH` 必须写在 `.env`。
+
+## 3. 远程 qmt-remote 客户端最小配置
+
+适用场景：策略跑在另一台机器上，通过 TCP 连远程 server。
+
+```env
+DEFAULT_DATA_PROVIDER=qmt-remote
+DEFAULT_BROKER=qmt-remote
+QMT_SERVER_HOST=10.0.0.8
+QMT_SERVER_PORT=58620
+QMT_SERVER_TOKEN=secret
+```
+
+运行：
+
+```bash
+bullet-trade live strategies/demo_strategy.py --broker qmt-remote
+```
+
+单账户时，不用写 `QMT_SERVER_ACCOUNT_KEY`。
+
+如果策略外层还接了其他调度网关，要分清两层端口：
+
+- `QMT_SERVER_PORT`：bullet-trade server 端口，默认常用 `58620`。
+- 上层网关端口：由上层系统自己的配置维护，不要填到 `QMT_SERVER_PORT`。
+
+## 4. 重点配置
+
+这些不是都必须配置，但排查实盘时最常用。
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `MARKET_BUY_PRICE_PERCENT` | `0.015` | 普通 `bullet-trade` 市价买入保护价偏移，参考价乘以 `1 + pct`，默认买高 1.5%。 |
+| `MARKET_SELL_PRICE_PERCENT` | `-0.015` | 普通 `bullet-trade` 市价卖出保护价偏移，参考价乘以 `1 + pct`，默认卖低 1.5%。 |
+| `TRADE_MAX_WAIT_TIME` | `16` | 实盘下单/撤单同步等待秒数；设为 `0` 或小于等于 `0` 时走异步立即返回。 |
+| `QMT_SERVER_RPC_TIMEOUT` | `60` | `qmt-remote` 客户端等待远程 server 响应的网络超时；应大于 `TRADE_MAX_WAIT_TIME` 或单次 `wait_timeout` 加安全余量。 |
+| `QMT_PLACE_ORDER_TIMEOUT_MARGIN` | `30` | 远程下单时在 `wait_timeout` 之外追加的请求超时安全余量，避免服务端刚返回 open/timed_out 时客户端先超时。 |
+| `MIN_BUY_ORDER_VALUE` | `0` | 最小买入订单金额；`0` 表示不限制，只拦截买入，不拦截卖出、降仓、清仓。 |
+| `RISK_CHECK_ENABLED` | `false` | 本地 LiveEngine 风控开关；开启后才使用本地风控参数。 |
+| `QMT_SERVER_ORDER_RISK_ENABLED` | `false` | 远程 QMT server 风控开关；开启后 server 端才使用风控参数。 |
+
+## 5. 多账户参数
+
+### server 端
+
+如果一个 server 上挂多个账户，才需要 `--accounts` 或 `QMT_SERVER_ACCOUNTS`。
+
+股票账户：
+
+```bash
+--accounts main=123456
+```
+
+期货账户：
+
+```bash
+--accounts hedge=654321:future
+```
+
+也可以写成环境变量：
+
+```env
+QMT_SERVER_ACCOUNTS=main=123456,hedge=654321:future
+```
+
+### 客户端
+
+多账户时，客户端才需要指定：
+
+```env
+QMT_SERVER_ACCOUNT_KEY=main
+QMT_SERVER_SUB_ACCOUNT=demo@main
+```
+
+## 6. 通用配置
+
+| 变量 | 默认/示例 | 作用 |
+| --- | --- | --- |
+| `BT_ENV_FILE` / `BULLET_TRADE_ENV_FILE` / `ENV_FILE` | `./.env.live` | 显式指定要加载的 `.env` 文件；优先于自动向上查找 `.env`。 |
+| `DEFAULT_DATA_PROVIDER` | `jqdata` | 默认行情源：`jqdata`、`tushare`、`myquant`、`qmt`、`qmt-remote`、`rqdata`、`easy_tdx`。RQData/easy_tdx 仍为 Beta，需要显式启用。 |
+| `DEFAULT_BROKER` | `simulator` | 默认券商/交易通道：`simulator`、`qmt`、`qmt-remote`、`huaxin`；远程华鑫策略通常仍选择 `qmt-remote`，由 server 使用 `huaxin` adapter。 |
+| `LOG_DIR` | `./logs` | 日志目录。 |
+| `LOG_LEVEL` | `INFO` | 控制台日志级别。 |
+| `LOG_FILE_LEVEL` | 跟随 `LOG_LEVEL` | 文件日志级别。 |
+| `RUNTIME_DIR` | `./runtime` | 运行态目录，保存 live 状态、`g` 自动保存等文件。 |
+| `BULLET_TRADE_HOME` | 用户 home | 研究环境、JupyterLab 设置、live lock 等默认目录的根路径覆盖。 |
+| `MESSAGE_KEY` / `WECHAT_MESSAGE_KEY` | 空 | 企业微信机器人 key，配置后 `send_msg` 会尝试推送。 |
+| `BT_LIVE_ORDER_DEBUG` | `false` | 打印 live/QMT 下单调试日志。 |
+| `LOG_FORCE_COLOR` | 空 | 强制彩色日志。 |
+| `NO_COLOR` | 空 | 禁用彩色日志。 |
+
+## 7. 数据源与缓存
+
+| 变量 | 默认/示例 | 作用 |
+| --- | --- | --- |
+| `DATA_CACHE_DIR` | 空 | 行情缓存根目录；有值时按 provider 创建子目录，留空禁用磁盘缓存。 |
+| `JQDATA_USERNAME` / `JQDATA_PASSWORD` | 空 | 聚宽数据账号密码。 |
+| `JQDATA_USER` / `JQDATA_PWD` | 空 | 聚宽账号密码旧别名，仍兼容。 |
+| `JQDATA_SERVER` / `JQDATA_PORT` | 空 / `0` | 聚宽自定义服务地址和端口。 |
+| `JQDATA_CACHE_EXPIRE_DAYS` | `1` | 动态区间缓存过期天数。 |
+| `JQDATA_CACHE_FORMAT` | `parquet` | DataFrame 缓存格式；失败时内部会回退。 |
+| `JQDATA_CACHE_VERSION` | `2` | 缓存 schema 版本；改值可强制旧缓存失效。 |
+| `TUSHARE_TOKEN` | 空 | Tushare token。 |
+| `TUSHARE_CUSTOM_URL` | 空 | Tushare 自定义接入地址。 |
+| `MYQUANT_TOKEN` | 空 | 掘金量化 token，需在掘金平台申请；也可用 `gm` 作为 provider 别名。 |
+| `MYQUANT_SERVER` | `localhost` | 自定义掘金终端地址（如本地运行终端）。 |
+| `MYQUANT_PORT` | `7070` | 自定义掘金终端端口。 |
+| `RQDATA_LICENSE` | 空 | RQData license；配置后优先使用 license 初始化 `rqdatac`。 |
+| `RQDATA_USERNAME` / `RQDATA_PASSWORD` | 空 | RQData 用户名和密码；未配置 license 时使用。 |
+| `RQDATA_USER` / `RQDATA_PWD` | 空 | RQData 账号密码旧别名，仍兼容。 |
+| `EASY_TDX_HOST` / `EASY_TDX_PORT` | 自动选主机 / `7709` | easy_tdx 通达信 online 行情服务器地址和端口；留空 host 时使用 SDK 自动选主机。 |
+| `EASY_TDX_TIMEOUT` | `10` | easy_tdx 连接超时秒数。 |
+| `EASY_TDX_USE_STUB` | `false` | 仅用于测试/demo 的显式 stub 开关；真实模式连接失败不会返回假行情。 |
+| `QMT_DATA_PATH` | 空 | MiniQMT/xtquant 数据目录；本地 QMT 行情和本地 QMT 交易都依赖它。 |
+| `MINIQMT_AUTO_DOWNLOAD` | `true` | MiniQMT 行情是否自动下载；设为 `false` 时只读本地缓存。 |
+| `MINIQMT_MARKET` | `SH` | MiniQMT 行情市场代码。 |
+| `QMT_SERVER_HOST` / `QMT_SERVER_PORT` / `QMT_SERVER_TOKEN` | `127.0.0.1` / `58620` / 空 | `qmt-remote` 行情和交易客户端连接远程 bullet-trade server。 |
+| `QMT_SERVER_TLS_CERT` | 空 | `qmt-remote` 客户端 TLS 证书路径。 |
+
+## 8. 券商与本地 QMT
+
+| 变量 | 默认/示例 | 作用 |
+| --- | --- | --- |
+| `SIMULATOR_INITIAL_CASH` | `1000000` | `simulator` 券商初始资金。 |
+| `QMT_ACCOUNT_ID` | 空 | 本地 QMT 账户号；server 端没有 `QMT_SERVER_ACCOUNTS` 时也会作为 default 账户。 |
+| `QMT_ACCOUNT_TYPE` | `stock` | QMT 账户类型，例如 `stock` / `future`。 |
+| `QMT_DATA_PATH` | 空 | QMT 数据目录。 |
+| `QMT_SESSION_ID` | 空 | 固定 QMT session id；不填时由运行时生成或按默认逻辑处理。 |
+| `QMT_AUTO_SUBSCRIBE` | `true` | QMT 连接后是否自动订阅账户。 |
+
+## 9. 实盘运行参数
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `ORDER_MAX_VOLUME` | `1000000` | 单笔委托最大股数，超过会拆单。 |
+| `TRADE_MAX_WAIT_TIME` | `16` | 下单/撤单同步等待秒数；小于等于 `0` 时异步立即返回。 |
+| `QMT_SERVER_RPC_TIMEOUT` | `60` | 远程 QMT 客户端默认 RPC 超时，只保护网络响应，不代表等待成交时间。 |
+| `QMT_PLACE_ORDER_TIMEOUT_MARGIN` | `30` | 远程下单请求超时相对订单等待窗口的默认余量。 |
+| `EVENT_TIME_OUT` | `60` | 策略事件超时秒数。 |
+| `BT_LIVE_FAIL_ON_SCHEDULE_ERROR` | `false` | 调度任务报错时拒绝该批委托、锁死后续新委托并让 LiveEngine 异常退出；查询和已知订单撤单仍可执行。生产环境建议显式设为 `true`。 |
+| `STRATEGY_NAME` | 空 | 策略名称，用于订单备注和日志标识；未设置时通常用策略文件名。 |
+| `SCHEDULER_MARKET_PERIODS` | 空 | 覆盖交易时段，例如 `09:30-11:30,13:00-15:00`。 |
+| `ACCOUNT_SYNC_ENABLED` / `ACCOUNT_SYNC_INTERVAL` | `true` / `60` | 账户后台同步开关和间隔秒数。 |
+| `ORDER_SYNC_ENABLED` / `ORDER_SYNC_INTERVAL` | `true` / `10` | 订单后台轮询开关和间隔秒数。 |
+| `G_AUTOSAVE_ENABLED` / `G_AUTOSAVE_INTERVAL` | `true` / `60` | `g` 状态自动保存开关和间隔秒数。 |
+| `TICK_SUBSCRIPTION_LIMIT` | `100` | Tick 订阅标的数量上限。 |
+| `TICK_SYNC_ENABLED` / `TICK_SYNC_INTERVAL` | `true` / `2` | Tick 轮询同步开关和间隔秒数。 |
+| `RISK_CHECK_ENABLED` / `RISK_CHECK_INTERVAL` | `false` / `300` | 本地 LiveEngine 风控后台任务开关和间隔秒数。 |
+| `CALENDAR_SKIP_WEEKEND` | `true` | 非交易日检测时是否直接跳过周末。 |
+| `CALENDAR_RETRY_MINUTES` | `1` | 非交易日或交易日历暂不可用时的重试间隔分钟数。 |
+| `BROKER_HEARTBEAT_INTERVAL` | `30` | 券商心跳检测间隔秒数。 |
+| `PORTFOLIO_REFRESH_THROTTLE_MS` | `200` | 读取实时资金/持仓前的最小刷新间隔毫秒数。 |
+| `MARKET_BUY_PRICE_PERCENT` | `0.015` | 普通市价买入保护价偏移比例；例如 `0.015` 表示参考价上浮 1.5%。 |
+| `MARKET_SELL_PRICE_PERCENT` | `-0.015` | 普通市价卖出保护价偏移比例；例如 `-0.015` 表示参考价下浮 1.5%。 |
+
+## 10. 风控参数
+
+风控参数只在对应风控开关打开后拦截订单：
+
+- 本地 LiveEngine：`RISK_CHECK_ENABLED=true`
+- 远程 QMT server：`QMT_SERVER_ORDER_RISK_ENABLED=true`
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `MAX_ORDER_VALUE` | `100000` | 单笔订单金额上限。 |
+| `MAX_DAILY_TRADE_VALUE` | `500000` | 单日累计交易金额上限。 |
+| `MAX_DAILY_TRADES` | `100` | 单日最大交易次数。 |
+| `MAX_DAILY_CANCELS` | `100` | 单日最大撤单次数。 |
+| `MIN_CANCEL_INTERVAL_SECONDS` | `0.0` | 两次撤单之间的最小间隔秒数。 |
+| `MAX_CANCEL_PER_ORDER` | `3` | 单笔订单最大撤单尝试次数。 |
+| `MIN_BUY_ORDER_VALUE` | `0.0` | 最小买入订单金额；`0` 表示不限制，只检查买入。 |
+| `MAX_STOCK_COUNT` | `20` | 最大持仓标的数，仅买入检查。 |
+| `MAX_POSITION_RATIO` | `20.0` | 单标下单金额占总资产比例上限，单位是百分比。 |
+| `STOP_LOSS_RATIO` | `5.0` | 止损阈值，供风控辅助判断使用。 |
+
+## 11. 远程 QMT server
+
+这些配置作用在 `bullet-trade server` 进程。
+
+`QMT_SERVER_TYPE=qmt` 是 MiniQMT/xtquant 后端；`QMT_SERVER_TYPE=big_qmt` 或 CLI `--server-type big_qmt` 是大 QMT helper 后端。
+
+注意：大 QMT 本身不读这里的 `.env`。大 QMT helper 的账号、端口和密码在策略文件顶部参数里配置。这里的 `BIG_QMT_GATEWAY_*` 是外部 `bullet-trade server` 进程用来连接大 QMT helper 的配置，完整步骤见 [大 QMT 服务向导](big-qmt-server.md)。
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `QMT_SERVER_TYPE` | `qmt` | server adapter 类型。 |
+| `QMT_SERVER_LISTEN` | `0.0.0.0` | server 监听地址。 |
+| `QMT_SERVER_PORT` | `58620` | server 监听端口。 |
+| `QMT_SERVER_TOKEN` | 自动生成临时 token | 访问 token；生产环境必须显式配置。 |
+| `QMT_SERVER_ENABLE_DATA` | `true` | 是否启用远程行情接口。 |
+| `QMT_SERVER_ENABLE_BROKER` | `true` | 是否启用远程交易接口。 |
+| `QMT_SERVER_TLS_CERT` / `QMT_SERVER_TLS_KEY` | 空 | server 端 TLS 证书和私钥；两者都有值时启用 TLS。 |
+| `QMT_SERVER_ALLOWLIST` | 空 | 允许访问的 IP 或 CIDR 列表，逗号分隔。 |
+| `QMT_SERVER_MAX_CONNECTIONS` | `64` | 最大连接数。 |
+| `QMT_SERVER_MAX_SUBSCRIPTIONS` | `200` | 最大订阅数。 |
+| `QMT_SERVER_ALLOW_FULL_MARKET` | `false` | 是否允许全市场订阅。 |
+| `QMT_SERVER_LOG_FILE` | 空 | server 访问日志文件路径。 |
+| `QMT_SERVER_LOG_ACCOUNT` | `false` | 是否打印账户快照。 |
+| `QMT_SERVER_ACCESS_LOG` | `true` | 是否启用访问日志。 |
+| `QMT_SERVER_ORDER_RISK_ENABLED` | `false` | 是否启用 server 端订单/撤单风控。 |
+| `QMT_SERVER_IDEMPOTENCY_MAX_ENTRIES` | `50000` | 进程内交易写幂等条目上限；达到上限后新 key 在券商调用前失败关闭，已有 key 仍可安全查询。 |
+| `QMT_SERVER_ACCOUNTS` | 空 | 多账户映射，例如 `main=123456,hedge=654321:future`。 |
+| `QMT_SERVER_SUB_ACCOUNTS` | 空 | 子账户映射，例如 `demo@main:limit=50000`。 |
+
+交易写必须携带稳定 `idempotency_key`。Server 在当前进程内原子占位并保留到进程结束；
+缓存不会按 TTL 或 LRU 淘汰，以免旧 key 被重新执行，但受 `QMT_SERVER_IDEMPOTENCY_MAX_ENTRIES`
+硬上限约束。达到上限后只拒绝新的写 key，拒绝发生在券商调用前；已有 key 的结果和冲突判断继续
+可用。应在确认所有在途/未知订单后选择维护窗口安全重启，而不是通过删除条目继续下单。进程重启后
+不承诺跨重启 exactly-once，提交结果未知时只允许用柜台订单/成交事实对账，禁止自动重发。
+
+## 12. qmt-remote 客户端
+
+这些配置作用在远程客户端，也就是 `DEFAULT_DATA_PROVIDER=qmt-remote` 或 `DEFAULT_BROKER=qmt-remote` 的一侧。
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `QMT_SERVER_HOST` | `127.0.0.1` | 远程 bullet-trade server 地址。 |
+| `QMT_SERVER_PORT` | `58620` | 远程 bullet-trade server 端口。 |
+| `QMT_SERVER_TOKEN` | 空 | 远程访问 token；客户端必填。 |
+| `QMT_SERVER_TLS_CERT` | 空 | 客户端 TLS 证书路径。 |
+| `QMT_SERVER_ACCOUNT_KEY` | 空 | 多账户时指定 server 账户 key。 |
+| `QMT_SERVER_SUB_ACCOUNT` | 空 | 子账户 ID，用于远程账户路由。 |
+
+## 13. 下单规则配置文件
+
+下单的最小手数、步进、证券分类、涨跌停兜底规则在这个文件里：
+
+```text
+bullet_trade/config/security_overrides.json
+```
+
+常用字段：
+
+- `lot_rules`：最小手数与步进规则。
+- `by_category`：按证券分类设置 T+、滑点、价格精度。普通 `fund` 默认按 T+1，`money_market_fund` 默认按 T+0；具体代码的明确规则、数据源返回的 T+ 和运行时覆盖仍按现有优先级生效。
+- `by_code`：按单个证券覆盖分类、T+0、滑点等。
+- `limit_rules`：数据源没有返回涨跌停时，用前收或最新价按比例兜底。
+
+!!! warning "历史回测结果可能变化"
+    旧版本曾把所有 `fund` 默认视为 T+0。升级后，未配置代码级例外的普通股票 ETF 在买入当日不可卖、下一交易日才释放可卖数量；依赖 ETF 日内买卖的历史回测可能出现成交次数、持仓和收益变化。明确列入 `by_code` 的 T+0 品种及现金工具零费用规则不受影响。
+
+## 14. 一个判断原则
+
+如果只是先跑通：
+
+- 本地 MiniQMT：只配 `DEFAULT_DATA_PROVIDER`、`DEFAULT_BROKER`、`QMT_DATA_PATH`、`QMT_ACCOUNT_ID`。
+- MiniQMT 远程 server：只配 `QMT_DATA_PATH`、`QMT_ACCOUNT_ID`、`QMT_SERVER_TOKEN`。
+- 大 QMT 远程 server：先按 [大 QMT 服务向导](big-qmt-server.md) 在大 QMT 里启动 helper；外部 `bullet-trade server` 再配 `BIG_QMT_GATEWAY_URL`、`BIG_QMT_GATEWAY_PASSWORD`、`QMT_SERVER_TOKEN`。
+- 远程客户端：只配 `DEFAULT_DATA_PROVIDER`、`DEFAULT_BROKER`、`QMT_SERVER_HOST`、`QMT_SERVER_PORT`、`QMT_SERVER_TOKEN`。
+
+其他配置先不写进 `.env` 也可以，但需要查的时候，上面的索引应该都能找到。

@@ -10,6 +10,7 @@ QMT 券商适配（最小实现）
 import asyncio
 import inspect
 import hashlib
+import os
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 import time
@@ -17,13 +18,49 @@ import time
 from .base import BrokerBase
 from bullet_trade.core.models import OrderStatus
 from bullet_trade.core.globals import log
-from bullet_trade.utils.env_loader import get_broker_config, get_live_trade_config
+from bullet_trade.utils.env_loader import get_broker_config, get_live_trade_config, parse_bool
+
+
+def _order_debug_enabled() -> bool:
+    return parse_bool(os.getenv("BT_LIVE_ORDER_DEBUG", ""), default=False)
+
+
+def _format_order_debug_value(value: Any, *, max_length: int = 480) -> str:
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    text = repr(value)
+    if len(text) > max_length:
+        return text[: max_length - 3] + "..."
+    return text
+
+
+def _emit_order_debug(stage: str, **fields: Any) -> None:
+    if not _order_debug_enabled():
+        return
+    parts = [
+        f"{key}={_format_order_debug_value(value)}"
+        for key, value in fields.items()
+        if value is not None
+    ]
+    suffix = " ".join(parts)
+    message = f"[ORDER_DEBUG] qmt.{stage}"
+    if suffix:
+        message = f"{message} {suffix}"
+    log.info(message)
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value in (None, ""):
+            continue
+        return value
+    return None
 
 
 class QmtBroker(BrokerBase):
     """
     QMT 券商适配（基于 xtquant/xttrader）。
-    
+
     当前实现重点：
     - connect: 读取 QMT_DATA_PATH 等配置，启动 XtQuantTrader 并完成连接/订阅；
     - buy/sell/cancel/order_status：保留最小骨架，等待后续补齐真实交易调用；
@@ -69,120 +106,209 @@ class QmtBroker(BrokerBase):
             self._retry_interval = max(1, int(retry_interval)) if retry_interval is not None else 60
         except (TypeError, ValueError):
             self._retry_interval = 60
+        self._last_order_wait_results: Dict[str, Dict[str, Any]] = {}
 
     def _ensure_connected(self):
         if not self._connected:
             raise RuntimeError(f"QMT 未连接，请先调用 connect() 并确保 xtquant 环境可用, account_id: {self.account_id}, account_type: {self.account_type}")
 
+    @property
+    def is_connected(self) -> bool:
+        """返回 QMT broker 当前是否已连接。
+
+        Args:
+            None。
+
+        Returns:
+            bool: True 表示已连接，False 表示未连接或已断开。
+        """
+
+        return bool(self._connected)
+
     def connect(self) -> bool:
+        """执行一次有边界的 QMT 连接尝试。
+
+        Args:
+            None。
+
+        Returns:
+            bool: 连接和订阅成功时返回 True。
+
+        Raises:
+            RuntimeError: 缺少数据目录、xtquant 环境不可用、start/connect/subscribe 返回失败。
+
+        Side Effects:
+            成功时保存 xtquant trader/account/callback；失败时尽力清理本次创建的 trader。
+        """
+
         data_path = self._data_path
         if not data_path:
             raise RuntimeError("缺少 QMT 数据目录，请在 .env 中设置 QMT_DATA_PATH，或在实例化 QmtBroker 时传入 data_path。")
 
-        attempt = 0
-        while True:
-            attempt += 1
+        try:
+            from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback  # type: ignore
+            from xtquant.xttype import StockAccount  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                f"未检测到 xtquant 环境或导入失败，请在 Windows 安装 QMT/xtquant 并配置 Python 依赖, account_id: {self.account_id}, account_type: {self.account_type}, data_path: {data_path}"
+            ) from e
+
+        self._xt_imported = True
+        session_id = self._session_id or int(time.time() * 1000)
+        self._session_id = max(session_id + 1, int(time.time() * 1000))
+        trader = None
+        callback = None
+        account = None
+
+        try:
+
+            class _Callback(XtQuantTraderCallback):  # type: ignore
+                """QMT trader 回调桥。
+
+                职责:
+                    将 xtquant 断连事件同步到外层 QmtBroker。
+                核心协作对象:
+                    XtQuantTrader、QmtBroker。
+                关键状态:
+                    outer 指向外层 broker。
+                """
+
+                def __init__(self, outer: "QmtBroker"):
+                    """初始化回调桥。
+
+                    Args:
+                        outer: 外层 QMT broker。
+
+                    Returns:
+                        None。
+                    """
+
+                    self.outer = outer
+
+                def on_disconnected(self):  # noqa: N802
+                    """处理 xtquant 断连回调。
+
+                    Args:
+                        None。
+
+                    Returns:
+                        None。
+
+                    Side Effects:
+                        将外层 broker 标记为未连接。
+                    """
+
+                    self.outer._connected = False
+
+                # 其余回调后续接入（订单、成交、持仓变更）
+
+            trader = XtQuantTrader(data_path, session_id)  # type: ignore
+            callback = _Callback(self)
+            trader.register_callback(callback)  # type: ignore
+
             try:
-                from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback  # type: ignore
-                from xtquant.xttype import StockAccount  # type: ignore
-            except Exception as e:
-                raise RuntimeError(
-                    f"未检测到 xtquant 环境或导入失败，请在 Windows 安装 QMT/xtquant 并配置 Python 依赖, account_id: {self.account_id}, account_type: {self.account_type}, data_path: {data_path}"
-                ) from e
+                account = StockAccount(self.account_id, self.account_type.upper())  # type: ignore[arg-type]
+            except TypeError:
+                account = StockAccount(self.account_id)  # type: ignore[arg-type,call-arg]
 
-            self._xt_imported = True
-            session_id = self._session_id or int(time.time() * 1000)
-            self._session_id = session_id
+            start_ret = trader.start()  # type: ignore
+            if start_ret not in (0, None):
+                raise RuntimeError(f"xtquant start() 返回异常状态: {start_ret}")
 
+            connect_ret = trader.connect()  # type: ignore
+            if connect_ret not in (0, None):
+                raise RuntimeError(f"xtquant connect() 失败，返回码: {connect_ret}")
+
+            if self._auto_subscribe:
+                subscribe_ret = trader.subscribe(account)  # type: ignore
+                if subscribe_ret not in (0, None):
+                    raise RuntimeError(f"xtquant subscribe() 失败，返回码: {subscribe_ret}")
+
+        except Exception:
+            self._connected = False
+            self._cleanup_trader_attempt(trader, callback)
+            self._xt_trader = None
+            self._xt_account = None
+            self._xt_callback = None
+            raise
+
+        self._xt_trader = trader  # type: ignore[assignment]
+        self._xt_account = account
+        self._xt_callback = callback
+        self._connected = True
+
+        # 尝试读取账户与持仓快照并按 print_portfolio_info 风格打印
+        try:
+            # QMT 在刚连接后资产/持仓可能需要短暂刷新，这里稍等以提高命中率
+            time.sleep(0.2)
+            snap = self._build_account_snapshot()
             try:
-                class _Callback(XtQuantTraderCallback):  # type: ignore
-                    def __init__(self, outer: "QmtBroker"):
-                        self.outer = outer
-                    def on_disconnected(self):  # noqa: N802
-                        self.outer._connected = False
-                    # 其余回调后续接入（订单、成交、持仓变更）
+                from bullet_trade.utils.portfolio_printer import render_account_overview
 
-                trader = XtQuantTrader(data_path, session_id)  # type: ignore
-                callback = _Callback(self)
-                trader.register_callback(callback)  # type: ignore
-
-                try:
-                    account = StockAccount(self.account_id, self.account_type.upper())  # type: ignore[arg-type]
-                except TypeError:
-                    account = StockAccount(self.account_id)  # type: ignore[arg-type,call-arg]
-
-                start_ret = trader.start()  # type: ignore
-                if start_ret not in (0, None):
-                    raise RuntimeError(f"xtquant start() 返回异常状态: {start_ret}")
-
-                connect_ret = trader.connect()  # type: ignore
-                if connect_ret not in (0, None):
-                    raise RuntimeError(f"xtquant connect() 失败，返回码: {connect_ret}")
-
-                if self._auto_subscribe:
-                    subscribe_ret = trader.subscribe(account)  # type: ignore
-                    if subscribe_ret not in (0, None):
-                        raise RuntimeError(f"xtquant subscribe() 失败，返回码: {subscribe_ret}")
-
-            except Exception as exc:
-                try:
-                    if "trader" in locals():
-                        stop_fn = getattr(locals()["trader"], "stop", None)
-                        if callable(stop_fn):
-                            stop_fn()
-                except Exception:
-                    pass
-                if not self._retry_on_failure:
-                    raise
-                wait_s = self._retry_interval or 60
-                log.error(f"QMT 连接失败（第 {attempt} 次）: {exc}，{wait_s}s 后重试 account_id: {self.account_id}, account_type: {self.account_type}, data_path: {data_path}")
-                time.sleep(wait_s)
-                continue
-
-            self._xt_trader = trader  # type: ignore[name-defined]
-            self._xt_account = account
-            self._xt_callback = callback
-            self._connected = True
-
-            # 尝试读取账户与持仓快照并按 print_portfolio_info 风格打印
-            try:
-                # QMT 在刚连接后资产/持仓可能需要短暂刷新，这里稍等以提高命中率
-                time.sleep(0.2)
-                snap = self._build_account_snapshot()
-                try:
-                    from bullet_trade.utils.portfolio_printer import render_account_overview
-
-                    overview = render_account_overview(snap, limit=20)
-                    log.info("QMT 连接建立: account_id=%s, type=%s\n%s", self.account_id, self.account_type, overview)
-                except Exception:
-                    # 回退到简易行
-                    cash = snap.get("available_cash")
-                    total = snap.get("total_value")
-                    poss = snap.get("positions") or []
-                    log.info(
-                        f"QMT 连接建立: account_id={self.account_id}, type={self.account_type}, 现金={cash}, 总资产={total}, 持仓{len(poss)}"
-                    )
+                overview = render_account_overview(snap, limit=20)
+                log.info("QMT 连接建立: account_id=%s, type=%s\n%s", self.account_id, self.account_type, overview)
             except Exception:
+                # 回退到简易行
+                cash = snap.get("available_cash")
+                total = snap.get("total_value")
+                poss = snap.get("positions") or []
                 log.info(
-                    f"QMT 连接建立: account_id={self.account_id}, type={self.account_type}"
+                    f"QMT 连接建立: account_id={self.account_id}, type={self.account_type}, 现金={cash}, 总资产={total}, 持仓{len(poss)}"
                 )
+        except Exception:
+            log.info(
+                f"QMT 连接建立: account_id={self.account_id}, type={self.account_type}"
+            )
 
-            return True
+        return True
+
+    def _cleanup_trader_attempt(
+        self, trader: Optional[object], callback: Optional[object] = None
+    ) -> None:
+        """清理一次失败连接尝试中创建的 xtquant trader。
+
+        Args:
+            trader: 本次连接尝试创建的 trader，可能为 None。
+            callback: 本次注册的 callback，可能为 None。
+
+        Returns:
+            None。
+
+        Side Effects:
+            尽力调用 unregister/disconnect/stop，并清空当前连接状态。
+        """
+
+        if trader is None:
+            return
+        cleanup_errors: List[str] = []
+        if callback is not None:
+            for name in ("unregister_callback", "remove_callback"):
+                fn = getattr(trader, name, None)
+                if not callable(fn):
+                    continue
+                try:
+                    fn(callback)
+                    break
+                except Exception as exc:
+                    cleanup_errors.append(f"{name}: {exc}")
+        for name in ("disconnect", "stop"):
+            fn = getattr(trader, name, None)
+            if not callable(fn):
+                continue
+            try:
+                fn()
+            except Exception as exc:
+                cleanup_errors.append(f"{name}: {exc}")
+        if cleanup_errors:
+            log.warning(
+                "QMT 失败连接清理出现异常: account_id=%s errors=%s",
+                self.account_id,
+                "; ".join(cleanup_errors),
+            )
 
     def disconnect(self) -> bool:
         if self._xt_trader:
-            try:
-                disconnect_fn = getattr(self._xt_trader, "disconnect", None)
-                if callable(disconnect_fn):
-                    disconnect_fn()
-            except Exception:
-                pass
-            try:
-                stop_fn = getattr(self._xt_trader, "stop", None)
-                if callable(stop_fn):
-                    stop_fn()
-            except Exception:
-                pass
+            self._cleanup_trader_attempt(self._xt_trader, self._xt_callback)
 
         self._connected = False
         self._xt_trader = None
@@ -211,6 +337,7 @@ class QmtBroker(BrokerBase):
         orders = self.sync_orders()
         open_states = {
             OrderStatus.new.value,
+            "submitted",
             OrderStatus.open.value,
             OrderStatus.filling.value,
             OrderStatus.canceling.value,
@@ -233,6 +360,7 @@ class QmtBroker(BrokerBase):
                     is_buy = self._map_order_side(item.get("order_type"))
                 if is_buy is not None:
                     row["is_buy"] = bool(is_buy)
+                self._attach_order_wait_trace(row, row.get("order_id"))
                 result.append(row)
         return result
 
@@ -279,7 +407,19 @@ class QmtBroker(BrokerBase):
                 is_buy = self._map_order_side(item.get("order_type"))
             if is_buy is not None:
                 row["is_buy"] = bool(is_buy)
+            self._attach_order_wait_trace(row, row.get("order_id"))
             result.append(row)
+            _emit_order_debug(
+                "get_orders_row",
+                order_id=row.get("order_id"),
+                security=row.get("security"),
+                raw_status=item.get("status"),
+                mapped_status=row.get("status"),
+                order_price=item.get("order_price"),
+                price=row.get("price"),
+                filled=row.get("filled"),
+                order_type=item.get("order_type"),
+            )
         return result
 
     def get_trades(
@@ -328,25 +468,90 @@ class QmtBroker(BrokerBase):
             if security and jq_code != security:
                 continue
             trade_id = _pick(item, "trade_id", "deal_no", "trade_no")
-            price = _pick(item, "trade_price", "price")
-            amount = _pick(item, "trade_volume", "volume", "amount")
-            trade_time = _pick(item, "trade_time", "time")
-            commission = _pick(item, "commission", "comm")
-            tax = _pick(item, "tax", "stamp_tax")
+            price = _first_present(
+                _pick(item, "traded_price"),
+                _pick(item, "trade_price"),
+                _pick(item, "avg_price", "avg_cost"),
+                _pick(item, "price"),
+            )
+            amount = _first_present(
+                _pick(item, "trade_volume"),
+                _pick(item, "traded_volume"),
+                _pick(item, "volume"),
+                _pick(item, "amount"),
+            )
+            trade_time = _first_present(
+                _pick(item, "trade_time"),
+                _pick(item, "traded_time"),
+                _pick(item, "time"),
+            )
+            commission = _first_present(
+                _pick(item, "commission_fee"),
+                _pick(item, "commission"),
+                _pick(item, "comm"),
+            )
+            tax = _first_present(_pick(item, "tax"), _pick(item, "stamp_tax"))
+            deal_balance = _first_present(
+                _pick(item, "deal_balance"),
+                _pick(item, "traded_amount"),
+                _pick(item, "trade_value"),
+                _pick(item, "amount_value"),
+            )
+            order_remark = _first_present(_pick(item, "order_remark"), _pick(item, "remark"))
+            strategy_name = _first_present(_pick(item, "strategy_name"), _pick(item, "strategy"))
             if not trade_id:
                 base = f"{oid}-{trade_time}-{price}-{amount}"
                 trade_id = hashlib.md5(base.encode("utf-8")).hexdigest()[:16]
-            result.append(
-                {
-                    "trade_id": str(trade_id),
-                    "order_id": str(oid) if oid is not None else "",
-                    "security": jq_code,
-                    "amount": int(amount or 0),
-                    "price": float(price or 0.0),
-                    "time": trade_time,
-                    "commission": float(commission or 0.0),
-                    "tax": float(tax or 0.0),
-                }
+            try:
+                normalized_amount = int(amount or 0)
+            except Exception:
+                normalized_amount = 0
+            try:
+                normalized_price = float(price or 0.0)
+            except Exception:
+                normalized_price = 0.0
+            try:
+                normalized_commission = float(commission or 0.0)
+            except Exception:
+                normalized_commission = 0.0
+            try:
+                normalized_tax = float(tax or 0.0)
+            except Exception:
+                normalized_tax = 0.0
+            if deal_balance in (None, "") and normalized_amount > 0 and normalized_price > 0:
+                deal_balance = normalized_amount * normalized_price
+            try:
+                normalized_deal_balance = float(deal_balance or 0.0)
+            except Exception:
+                normalized_deal_balance = 0.0
+            row = {
+                "trade_id": str(trade_id),
+                "order_id": str(oid) if oid is not None else "",
+                "security": jq_code,
+                "amount": normalized_amount,
+                "price": normalized_price,
+                "traded_price": normalized_price,
+                "deal_balance": normalized_deal_balance,
+                "time": trade_time,
+                "commission": normalized_commission,
+                "commission_fee": normalized_commission,
+                "tax": normalized_tax,
+                "order_remark": order_remark,
+                "strategy_name": strategy_name,
+            }
+            self._attach_order_wait_trace(row, oid)
+            result.append(row)
+            _emit_order_debug(
+                "get_trades_row",
+                trade_id=str(trade_id),
+                order_id=str(oid) if oid is not None else "",
+                security=jq_code,
+                price=price,
+                amount=amount,
+                trade_time=trade_time,
+                commission=commission,
+                tax=tax,
+                deal_balance=deal_balance,
             )
         return result
 
@@ -359,6 +564,7 @@ class QmtBroker(BrokerBase):
         remark: Optional[str] = None,
         *,
         market: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         买入（支持按数量拆单 + 同步/异步等待骨架）。
@@ -366,6 +572,7 @@ class QmtBroker(BrokerBase):
         - TRADE_MAX_WAIT_TIME>0 视为同步等待，=0 异步立即返回；
         实际下单需接入 xtquant 后实现 _send_order。
         """
+        _ = extra
         self._ensure_connected()
         if amount <= 0:
             raise ValueError("买入数量必须为正")
@@ -390,11 +597,13 @@ class QmtBroker(BrokerBase):
         remark: Optional[str] = None,
         *,
         market: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         卖出（支持按数量拆单 + 同步/异步等待骨架）。
         实际下单需接入 xtquant 后实现 _send_order。
         """
+        _ = extra
         self._ensure_connected()
         if amount <= 0:
             raise ValueError("卖出数量必须为正")
@@ -465,6 +674,8 @@ class QmtBroker(BrokerBase):
                     status = None
                     code = None
                     price = None
+                    explicit_order_price = None
+                    price_type = None
                     qty = None
                     filled = None
                     traded_price = None
@@ -482,6 +693,8 @@ class QmtBroker(BrokerBase):
                         order_type = it.get("order_type")
                         order_remark = it.get("order_remark") or it.get("remark")
                         strategy_name = it.get("strategy_name") or it.get("strategy")
+                        explicit_order_price = it.get("order_price")
+                        price_type = it.get("price_type") or it.get("priceType")
                     else:
                         for attr in ("order_id", "orderId", "entrust_id"):
                             if hasattr(it, attr):
@@ -511,20 +724,50 @@ class QmtBroker(BrokerBase):
                             order_remark = getattr(it, "order_remark")
                         if hasattr(it, "strategy_name"):
                             strategy_name = getattr(it, "strategy_name")
+                        if hasattr(it, "order_price"):
+                            explicit_order_price = getattr(it, "order_price")
+                        for attr in ("price_type", "priceType"):
+                            if hasattr(it, attr):
+                                price_type = getattr(it, attr)
+                                break
                     if str(oid) == str(order_id):
+                        if explicit_order_price is not None:
+                            order_price = explicit_order_price
+                        elif self._is_market_price_type(price_type) and traded_price is not None:
+                            order_price = None
+                        else:
+                            order_price = price
                         mapped_status = self._map_order_status(status)
-                        return {
+                        _emit_order_debug(
+                            "order_status_raw",
+                            order_id=str(oid),
+                            security=code,
+                            raw_status=status,
+                            mapped_status=mapped_status.value if isinstance(mapped_status, OrderStatus) else mapped_status,
+                            order_price=order_price,
+                            broker_price=price,
+                            traded_price=traded_price,
+                            filled=filled,
+                            amount=qty,
+                            order_type=order_type,
+                            order_remark=order_remark,
+                            strategy_name=strategy_name,
+                        )
+                        row = {
                             "order_id": str(oid),
                             "status": mapped_status.value if isinstance(mapped_status, OrderStatus) else mapped_status,
                             "raw_status": status,
                             "security": code,
                             "price": traded_price or price,
+                            "order_price": order_price,
                             "amount": qty,
                             "filled": filled,
                             "order_type": order_type,
                             "order_remark": order_remark,
                             "strategy_name": strategy_name,
                         }
+                        self._attach_order_wait_trace(row, oid)
+                        return row
             except Exception:
                 continue
         return {}
@@ -630,6 +873,45 @@ class QmtBroker(BrokerBase):
             return False
         return None
 
+    def _is_market_price_type(self, price_type: Any) -> bool:
+        if price_type is None:
+            return False
+        try:
+            from xtquant import xtconstant  # type: ignore
+
+            market_values = {
+                getattr(xtconstant, "MARKET_SH_CONVERT_5_CANCEL", None),
+                getattr(xtconstant, "MARKET_SZ_CONVERT_5_CANCEL", None),
+                getattr(xtconstant, "MARKET_PEER_PRICE_FIRST", None),
+                getattr(xtconstant, "MARKET_MINE_PRICE_FIRST", None),
+                getattr(xtconstant, "ANY_PRICE", None),
+                getattr(xtconstant, "ORDER_PRICE_TYPE_MARKET", None),
+                getattr(xtconstant, "ORDER_PRICE_TYPE_BEST5_OR_CANCEL", None),
+                getattr(xtconstant, "ORDER_PRICE_TYPE_FIVE_LEVEL_INSTANT_OR_CANCEL", None),
+                getattr(xtconstant, "MARKET_PRICE", None),
+            }
+            market_values.discard(None)
+            if price_type in market_values:
+                return True
+        except Exception:
+            pass
+        label = str(price_type).strip().lower()
+        return any(
+            token in label
+            for token in (
+                "market",
+                "best",
+                "peer",
+                "mine",
+                "any_price",
+                "对手方最优",
+                "本方最优",
+                "五档",
+                "即时成交",
+                "最优价",
+            )
+        )
+
     # ---------------- 内部辅助 ----------------
     def _split_volume(self, total: int) -> List[int]:
         """按 ORDER_MAX_VOLUME 拆分数量。"""
@@ -674,17 +956,83 @@ class QmtBroker(BrokerBase):
                 except TypeError:
                     return (security, amount, price, side)
 
-    async def _maybe_wait(self, order_id: str, override_timeout: Optional[float] = None) -> None:
-        """根据 TRADE_MAX_WAIT_TIME 执行同步等待骨架（协程版）"""
+    def get_last_order_wait_result(self, order_id: str) -> Dict[str, Any]:
+        """读取最近一次下单等待结果。
+
+        Args:
+            order_id: 远端券商订单号。
+
+        Returns:
+            Dict[str, Any]: 包含 timed_out、async_tracking、last_snapshot 等字段的快照；
+            不存在时返回空字典。
+        """
+        return dict(self._last_order_wait_results.get(str(order_id), {}) or {})
+
+    def _attach_order_wait_trace(self, row: Dict[str, Any], order_id: Any) -> None:
+        """把最近一次同步等待追踪字段追加到订单或成交快照。
+
+        Args:
+            row: 即将返回给调用方的订单或成交字典。
+            order_id: 远端券商订单号，可能为空。
+
+        Returns:
+            None: 原地更新 row。
+
+        Side Effects:
+            只追加 `timed_out`、`async_tracking`、`last_snapshot` 等可选诊断字段，
+            不覆盖券商查询得到的真实状态、成交数量和成交金额。
+        """
+
+        if not order_id:
+            return
+        wait_result = self._last_order_wait_results.get(str(order_id))
+        if not isinstance(wait_result, dict):
+            return
+        for key in ("timed_out", "async_tracking", "wait_timeout", "elapsed"):
+            if key in wait_result:
+                row[key] = wait_result.get(key)
+        snapshot = wait_result.get("last_snapshot")
+        if isinstance(snapshot, dict):
+            row["last_snapshot"] = dict(snapshot)
+            for key in ("order_remark", "strategy_name"):
+                if not row.get(key) and snapshot.get(key):
+                    row[key] = snapshot.get(key)
+            if row.get("raw_status") in (None, "") and snapshot.get("raw_status") not in (None, ""):
+                row["raw_status"] = snapshot.get("raw_status")
+
+    async def _maybe_wait(self, order_id: str, override_timeout: Optional[float] = None) -> Dict[str, Any]:
+        """根据 TRADE_MAX_WAIT_TIME 执行同步等待骨架（协程版）。
+
+        Args:
+            order_id: 已提交成功的券商订单号。
+            override_timeout: 本次请求覆盖的等待秒数；None 时读取全局配置。
+
+        Returns:
+            Dict[str, Any]: 等待结果。等待终态超时时返回 timed_out=True，
+            异步提交模式返回 async_tracking=True。
+        """
         from bullet_trade.utils.env_loader import get_live_trade_config
 
         if override_timeout is not None:
-            wait_s = float(override_timeout)
+            wait_source = override_timeout
         else:
-            wait_s = int(get_live_trade_config().get("trade_max_wait_time") or 0)
+            wait_source = get_live_trade_config().get("trade_max_wait_time") or 0
+        try:
+            wait_s = float(wait_source)
+        except (TypeError, ValueError):
+            log.warning(f"订单 {order_id} 等待窗口配置无效: {wait_source!r}，改为异步追踪")
+            wait_s = 0.0
         if wait_s <= 0:
             log.info(f"订单 {order_id} 采用异步模式（TRADE_MAX_WAIT_TIME<=0），交由后台同步任务跟踪")
-            return
+            result = {
+                "order_id": str(order_id),
+                "status": "submitted",
+                "timed_out": False,
+                "async_tracking": True,
+                "wait_timeout": wait_s,
+            }
+            self._last_order_wait_results[str(order_id)] = result
+            return dict(result)
         deadline = time.time() + wait_s
         interval = 0.5
         start = time.time()
@@ -696,7 +1044,24 @@ class QmtBroker(BrokerBase):
                 status = await self.get_order_status(order_id)
                 last_snapshot = status or {}
                 st = str(last_snapshot.get("status") or "").lower()
-                if st in ("filled", "cancelled", "canceled", "partly_canceled", "rejected"):
+                _emit_order_debug(
+                    "wait_poll",
+                    order_id=order_id,
+                    elapsed=round(time.time() - start, 3),
+                    status=st,
+                    raw_status=last_snapshot.get("raw_status"),
+                    price=last_snapshot.get("price"),
+                    filled=last_snapshot.get("filled"),
+                )
+                if st in (
+                    "filled",
+                    "cancelled",
+                    "canceled",
+                    "partly_canceled",
+                    "rejected",
+                    "failed",
+                    "error",
+                ):
                     final_status = st
                     break
             except Exception:
@@ -705,7 +1070,7 @@ class QmtBroker(BrokerBase):
         elapsed = time.time() - start
         if final_status:
             level = log.info
-            if final_status in ("rejected", "canceled", "cancelled"):
+            if final_status in ("rejected", "canceled", "cancelled", "failed", "error"):
                 level = log.error
             level(
                 f"订单 {order_id} 等待 {elapsed:.2f}s 获得状态 {final_status}，"
@@ -716,6 +1081,24 @@ class QmtBroker(BrokerBase):
                 f"订单 {order_id} 等待 {elapsed:.2f}s 仍未完成，"
                 f"最后快照={last_snapshot or '无'}，继续由异步同步逻辑追踪"
             )
+        result = {
+            "order_id": str(order_id),
+            "timed_out": final_status is None,
+            "async_tracking": final_status is None,
+            "wait_timeout": wait_s,
+            "elapsed": elapsed,
+        }
+        if last_snapshot:
+            result["last_snapshot"] = last_snapshot
+            result["status"] = final_status or str(last_snapshot.get("status") or "open")
+            if last_snapshot.get("raw_status") is not None:
+                result["raw_status"] = last_snapshot.get("raw_status")
+        elif final_status:
+            result["status"] = final_status
+        else:
+            result["status"] = "submitted"
+        self._last_order_wait_results[str(order_id)] = result
+        return dict(result)
 
     def _map_security(self, security: str) -> str:
         """将聚宽风格代码映射到 QMT 常见风格。
@@ -769,20 +1152,27 @@ class QmtBroker(BrokerBase):
     def _choose_market_price_type(self, security: str, xtconstant) -> Any:
         """
         根据市场选择更具体的市价类型，避免退回限价。
+
+        默认优先使用“对手方最优价”，让 order(..., price=None) 在沪深两市语义保持一致；
+        交易所专用的五档即时成交剩余撤销仅作为兼容兜底。
         """
         market = None
         if "." in security:
             market = security.split(".")[-1].upper()
-        # 上交所/北交所：最优五档即时成交剩余撤销
-        if market == "SH":
+        if market == "XSHG":
+            market = "SH"
+        elif market == "XSHE":
+            market = "SZ"
+        # 沪深北默认都优先使用对手方最优价，五档即时成交剩余撤销作为市场专用兜底。
+        # xtconstant.MARKET_PEER_PRICE_FIRST 标注支持上交所/深交所/北交所股票。
+        if market in ("SH", "BJ", "BSE"):
             return (
-                getattr(xtconstant, "MARKET_SH_CONVERT_5_CANCEL", None)
-                or getattr(xtconstant, "MARKET_PEER_PRICE_FIRST", None)
+                getattr(xtconstant, "MARKET_PEER_PRICE_FIRST", None)
                 or getattr(xtconstant, "MARKET_MINE_PRICE_FIRST", None)
+                or getattr(xtconstant, "MARKET_SH_CONVERT_5_CANCEL", None)
                 or getattr(xtconstant, "ANY_PRICE", None)
                 or getattr(xtconstant, "FIX_PRICE", None)
             )
-        # 深交所：对手方最优价
         if market == "SZ":
             return (
                 getattr(xtconstant, "MARKET_PEER_PRICE_FIRST", None)
@@ -952,7 +1342,7 @@ class QmtBroker(BrokerBase):
                 oid = _pick(item, "order_id", "entrust_id")
                 code = _pick(item, "stock_code", "code")
                 amount = _pick(item, "order_volume", "volume")
-                order_price = _pick(item, "price", "order_price")
+                raw_price = _pick(item, "price")
                 status = _pick(item, "order_status", "status")
                 filled = _pick(item, "traded_volume", "deal_volume", "filled_volume", "volume_traded")
                 traded_price = _pick(item, "traded_price", "avg_price", "trade_price")
@@ -963,26 +1353,48 @@ class QmtBroker(BrokerBase):
                 status_msg = _pick(item, "status_msg", "status_msg")
                 price_type = _pick(item, "price_type", "priceType")
                 order_time = _pick(item, "order_time", "time")
+                explicit_order_price = _pick(item, "order_price")
+                if explicit_order_price is not None:
+                    order_price = explicit_order_price
+                elif self._is_market_price_type(price_type) and traded_price is not None:
+                    order_price = None
+                else:
+                    order_price = raw_price
                 if not oid:
                     continue
-                orders.append(
-                    {
-                        "order_id": str(oid),
-                        "security": self._map_to_jq_symbol(code) if code else None,
-                        "amount": amount,
-                        "filled": 0 if filled is None else filled,
-                        "price": 0.0 if traded_price is None else traded_price,
-                        "order_price": order_price,
-                        "status": status,
-                        "order_type": order_type,
-                        "is_buy": self._map_order_side(order_type),
-                        "order_remark": order_remark,
-                        "strategy_name": strategy_name,
-                        "order_sysid": order_sysid,
-                        "status_msg": status_msg,
-                        "price_type": price_type,
-                        "order_time": order_time,
-                    }
+                row = {
+                    "order_id": str(oid),
+                    "security": self._map_to_jq_symbol(code) if code else None,
+                    "amount": amount,
+                    "filled": 0 if filled is None else filled,
+                    "price": 0.0 if traded_price is None else traded_price,
+                    "order_price": order_price,
+                    "status": status,
+                    "order_type": order_type,
+                    "is_buy": self._map_order_side(order_type),
+                    "order_remark": order_remark,
+                    "strategy_name": strategy_name,
+                    "order_sysid": order_sysid,
+                    "status_msg": status_msg,
+                    "price_type": price_type,
+                    "order_time": order_time,
+                    "broker_price": raw_price,
+                }
+                self._attach_order_wait_trace(row, oid)
+                orders.append(row)
+                _emit_order_debug(
+                    "sync_orders_row",
+                    order_id=str(oid),
+                    security=self._map_to_jq_symbol(code) if code else None,
+                    raw_status=status,
+                    order_price=order_price,
+                    broker_price=raw_price,
+                    traded_price=traded_price,
+                    filled=filled,
+                    amount=amount,
+                    order_type=order_type,
+                    order_remark=order_remark,
+                    strategy_name=strategy_name,
                 )
             except Exception:
                 continue
@@ -1108,6 +1520,15 @@ class QmtBroker(BrokerBase):
                             "market_value": float(market_value or 0.0),
                         }
                     )
+                    _emit_order_debug(
+                        "account_position_row",
+                        security=self._map_to_jq_symbol(code),
+                        amount=int(qty or 0),
+                        closeable_amount=int(avail or 0),
+                        avg_cost=float(avg_cost or 0.0),
+                        current_price=float(last or 0.0) if last is not None else 0.0,
+                        market_value=float(market_value or 0.0),
+                    )
                 except Exception:
                     continue
         snapshot["positions"] = positions
@@ -1124,4 +1545,10 @@ class QmtBroker(BrokerBase):
             snapshot["available_cash"] = cash_val
         if total_val is not None:
             snapshot["total_value"] = total_val
+        _emit_order_debug(
+            "account_snapshot",
+            available_cash=snapshot.get("available_cash"),
+            total_value=snapshot.get("total_value"),
+            positions_count=len(snapshot.get("positions") or []),
+        )
         return snapshot

@@ -3,9 +3,10 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 from bullet_trade.core.engine import BacktestEngine
 from bullet_trade.core.globals import g
-
 
 STRATEGY_FILE = Path(__file__).with_name("current_data_limit_probe.py")
 
@@ -20,7 +21,14 @@ def _load_strategy_module():
     return module
 
 
+@pytest.mark.requires_network
+@pytest.mark.requires_jqdata
 def test_current_data_limit_probe():
+    """
+    使用真实 JQData/聚宽镜像校验 current_data 涨跌停快照。
+
+    该用例依赖固定历史行情基准，默认离线 pytest 不运行。
+    """
     strategy = _load_strategy_module()
     engine = BacktestEngine(
         initialize=strategy.initialize,

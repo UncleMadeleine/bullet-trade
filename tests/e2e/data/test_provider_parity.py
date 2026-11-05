@@ -328,11 +328,15 @@ def test_tushare_vs_jqdata_single_day() -> None:
 
     security = "000001.XSHE"
     date_str = "2025-07-01"
+    fields = ["open", "high", "low", "close", "volume", "money"]
 
-    jq_none = jq.get_price(security, start_date=date_str, end_date=date_str, fq=None)
-    jq_pre = jq.get_price(security, start_date=date_str, end_date=date_str, fq="pre")
-    ts_none = ts.get_price(security, start_date=date_str, end_date=date_str, fq=None)
-    ts_pre = ts.get_price(security, start_date=date_str, end_date=date_str, fq="pre")
+    jq_none = jq.get_price(security, start_date=date_str, end_date=date_str, fields=fields, fq=None)
+    jq_pre = jq.get_price(security, start_date=date_str, end_date=date_str, fields=fields, fq="pre")
+    try:
+        ts_none = ts.get_price(security, start_date=date_str, end_date=date_str, fields=fields, fq=None)
+        ts_pre = ts.get_price(security, start_date=date_str, end_date=date_str, fields=fields, fq="pre")
+    except Exception as exc:
+        pytest.skip(f"Tushare 行情调用失败：{exc}")
 
     _assert_pre_diff(jq_none, jq_pre, "JQData")
     _assert_pre_diff(ts_none, ts_pre, "Tushare")
@@ -342,6 +346,11 @@ def test_tushare_vs_jqdata_single_day() -> None:
     epsilon = 0.05
     assert abs(jq_open - ts_open) <= epsilon
     assert abs(jq_close - ts_close) <= epsilon
+
+    jq_raw = jq_none.iloc[0]
+    ts_raw = ts_none.iloc[0]
+    assert abs(float(jq_raw["volume"]) - float(ts_raw["volume"])) <= 2000.0
+    assert abs(float(jq_raw["money"]) - float(ts_raw["money"])) <= 2000.0
 
 
 def test_multi_provider_single_day_fq_diff() -> None:
@@ -381,3 +390,48 @@ def test_multi_provider_single_day_fq_diff() -> None:
         data_api._provider = original_provider
         data_api._auth_attempted = original_auth_attempted
         data_api._security_info_cache = original_cache
+
+
+@pytest.mark.requires_qmt
+def test_miniqmt_resampled_recent_minute_bars_match_jqdata() -> None:
+    """
+    用固定的近期交易日验证 MiniQMT 由 1m 重采样出的 5m/15m 与 JQData 对齐。
+
+    日期按 2026-05-20 运行时的“上周交易日”固定，避免测试随当天日期漂移。
+    """
+    _check_prerequisites()
+    jq, mini = _authenticate_providers()
+    fields = ["open", "high", "low", "close", "volume", "money"]
+    start = "2026-05-14 09:30:00"
+    end = "2026-05-14 10:30:00"
+
+    for frequency in ("5m", "15m"):
+        jq_df = jq.get_price(
+            SECURITY,
+            start_date=start,
+            end_date=end,
+            frequency=frequency,
+            fields=fields,
+            fq="none",
+        )
+        mini_df = mini.get_price(
+            SECURITY,
+            start_date=start,
+            end_date=end,
+            frequency=frequency,
+            fields=fields,
+            fq="none",
+        )
+        if jq_df.empty or mini_df.empty:
+            pytest.skip(f"{frequency} 数据为空，请确认 JQData 权限和 MiniQMT 1m 本地数据。")
+
+        pd.testing.assert_index_equal(mini_df.index, jq_df.index)
+        for field in fields:
+            diff = (mini_df[field].astype(float) - jq_df[field].astype(float)).abs().max()
+            tolerance = 0.05
+            if field == "volume":
+                # QMT 分钟成交量按手给出，转成股后仍可能和聚宽存在零股级舍入差。
+                tolerance = 2000.0
+            elif field == "money":
+                tolerance = 1.0
+            assert diff <= tolerance, f"{frequency} {field} 与 JQData 最大偏差 {diff}"

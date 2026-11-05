@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import logging
 import pytest
 from datetime import datetime, timedelta
 import sys
@@ -36,6 +37,23 @@ def test_scheduler_creation():
     scheduler = AsyncScheduler()
     assert len(scheduler.get_all_tasks()) == 0
     print("✅ 调度器创建测试通过")
+
+
+def test_register_task_log_is_user_facing(caplog):
+    """注册日志应只说明定时任务存在，不暴露重叠处理细节。"""
+    caplog.set_level(logging.INFO, logger="jq_strategy")
+    scheduler = AsyncScheduler()
+
+    def task(_context):
+        pass
+
+    scheduler.run_daily(task, '09:00', OverlapStrategy.SKIP)
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "已注册定时任务" in messages
+    assert "每个交易日 09:00" in messages
+    assert "重叠处理" not in messages
+    assert "跳过" not in messages
 
 
 @pytest.mark.asyncio

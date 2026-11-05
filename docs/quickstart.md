@@ -1,178 +1,147 @@
-# 快速上手：三步跑通（聚宽兼容）
+# 快速上手
 
-目标：用原有聚宽策略，最少改动跑通回测与实盘（本地或远程）。如需细节配置，参考 [配置总览](config.md)。
+这页保留作为旧入口。  
+如果你是第一次使用 BulletTrade，推荐先看：
 
-## 系统架构
+- [新手入门总览：先选方案，再看对应文档](beginner-guide.md)
+- [环境准备：先安装 Python，再创建虚拟环境](python-setup.md)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            BulletTrade 架构概览                              │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │                           策略层                                      │   │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │   │
-│  │  │ from jqdata │  │ initialize  │  │ run_daily   │  │ order_*     │  │   │
-│  │  │ import *    │  │ (context)   │  │ handle_data │  │ 交易函数     │  │   │
-│  │  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘  │   │
-│  │                       ↑ 聚宽兼容 API，无需改代码                         │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                                     │                                       │
-│                                     ▼                                       │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │                          引擎层                                       │   │
-│  │  ┌─────────────────┐          ┌─────────────────┐                    │   │
-│  │  │   回测引擎       │          │   实盘引擎       │                     │   │
-│  │  │  BacktestEngine │          │   LiveEngine    │                    │   │
-│  │  │  - 历史数据回放   │          │  - 实时行情驱动  │                     │   │
-│  │  │  - 模拟撮合      │          │  - 真实下单      │                     │   │
-│  │  │  - 分红送股处理   │          │  - 状态持久化    │                     │   │
-│  │  └─────────────────┘          └─────────────────┘                    │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                         │                     │                             │
-│            ┌────────────┴─────────┐    ┌──────┴───────┐                     │
-│            ▼                      ▼    ▼              ▼                     │
-│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐          │
-│  │    数据层        │    │    券商层        │    │    工具层        │          │
-│  │  ┌───────────┐  │    │  ┌───────────┐  │    │  ┌───────────┐  │          │
-│  │  │ JQData    │  │    │  │ QMT本地    │  │    │  │ 参数优化   │  │          │
-│  │  │ MiniQMT   │  │    │  │ QMT远程    │  │    │  │ 报告生成   │  │          │
-│  │  │ TuShare   │  │    │  │ Simulator │  │    │  │ 研究环境   │  │          │
-│  │  └───────────┘  │    │  └───────────┘  │    │  └───────────┘  │          │
-│  └─────────────────┘    └─────────────────┘    └─────────────────┘          │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+那一页已经把下面这些问题合并讲清楚了：
 
-## 工作流程
+- 我们支持哪两种方案
+- 两种方案的结构分别是什么
+- 怎么决策选 A 或 B
+- 进入 A 方案或 B 方案的详细文档
 
-```
-┌─────────────┐      ┌─────────────┐      ┌─────────────┐      ┌─────────────┐
-│  1. 安装     │  →   │  2. 配置    │  →   │  3. 运行     │  →   │  4. 分析     │
-│  pip install│      │  .env 文件  │       │  CLI 命令   │      │  查看报告     │
-└─────────────┘      └─────────────┘      └─────────────┘      └─────────────┘
-       │                    │                    │                    │
-       ▼                    ▼                    ▼                    ▼
-  bullet-trade         数据源账号           backtest/live       HTML/CSV 报告
-  一行安装完成          券商配置              一键启动            风险指标分析
-```
+## 如果你只想看最短路径
 
-## 1. 安装与准备环境
+最短顺序仍然是：
+
+1. 先安装
+2. 先跑一个最小回测
+3. 再打通本地 QMT 或远程 `qmt-remote`
+
+## 1. 安装
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+```
+
+Windows：
+
+```bash
+.venv\Scripts\activate
+```
+
+安装：
+
+```bash
 pip install bullet-trade
 ```
 
-开发模式：
+## 2. 回测
+
 ```bash
-pip install -e "bullet-trade[dev]"
+bullet-trade backtest strategies/demo_strategy.py --start 2024-01-01 --end 2024-06-01
 ```
 
-> 提示：使用 `pip install bullet-trade` 时，实盘 CLI 读取的是已安装包；本地改源码后若想立即生效，请改用 `pip install -e "bullet-trade[dev]"` 并重启进程/Kernel。
+## 3. 本地 QMT
 
-复制模板：
-```bash
-cp env.backtest.example .env    # 回测
-cp env.live.example .env        # 实盘/远程
+本节是 MiniQMT/xtquant 直连配置。它要求本机有 `userdata_mini` 数据目录，并且能加载 MiniQMT/xtquant。大 QMT 不使用 `QMT_DATA_PATH` 直连；如果要用大 QMT，请看 [大 QMT 服务向导](big-qmt-server.md)，启动后客户端仍走第 5 节的 `qmt-remote`。
+
+如果你还不知道 `.env` 是什么，先看：
+
+- [什么是 `.env` 文件，怎么创建](python-setup.md#env-file)
+
+下面这些代码块不是命令，而是要写进 `.env` 文件里的内容。
+
+`.env` 最少：
+
+```env
+DEFAULT_DATA_PROVIDER=qmt
+DEFAULT_BROKER=qmt
+QMT_DATA_PATH=C:\国金QMT交易端\userdata_mini
+QMT_ACCOUNT_ID=123456
 ```
 
-## 2. 兼容聚宽的最小策略
+运行：
 
-```python
-from jqdata import *
-
-def initialize(context):
-    set_benchmark('000300.XSHG')
-    set_option('use_real_price', True)
-    g.stocks = ['000001.XSHE', '600000.XSHG']
-    run_daily(trade, time='10:00')
-
-def trade(context):
-    order(g.stocks[0], 100)
-    order(g.stocks[1], 200)
-```
-
-> 聚宽 API 直接可用，无需改接口；仅通过 `.env` 切换数据源/券商。
-
-## 3. 直接运行
-
-### 回测
-```bash
-bullet-trade backtest strategies/demo_strategy.py \
-    --start 2024-01-01 --end 2024-06-01 \
-    --output backtest_results/demo
-```
-
-### 参数优化
-```bash
-bullet-trade optimize strategies/demo_strategy.py \
-    --params params.json \
-    --start 2020-01-01 --end 2023-12-31 \
-    --output optimization.csv
-```
-
-### 本地实盘（QMT/模拟）
 ```bash
 bullet-trade live strategies/demo_strategy.py --broker qmt
 ```
 
-### 远程实盘（qmt-remote）
+## 4. 远程 server
+
+下面是 MiniQMT 后端的远程 server 配置。如果 Windows 侧使用大 QMT，请改用 [大 QMT 服务向导](big-qmt-server.md) 里的 `bullet-trade server --server-type big_qmt`。
+
+Windows 上的 `.env` 最少：
+
+```env
+QMT_DATA_PATH=C:\国金QMT交易端\userdata_mini
+QMT_ACCOUNT_ID=123456
+QMT_SERVER_TOKEN=secret
+```
+
+启动：
+
+```bash
+bullet-trade --env-file .env server --listen 0.0.0.0 --port 58620 --enable-data --enable-broker
+```
+
+## 5. 远程 qmt-remote 客户端
+
+客户端 `.env` 最少：
+
+```env
+DEFAULT_DATA_PROVIDER=qmt-remote
+DEFAULT_BROKER=qmt-remote
+QMT_SERVER_HOST=10.0.0.8
+QMT_SERVER_PORT=58620
+QMT_SERVER_TOKEN=secret
+```
+
+运行：
+
 ```bash
 bullet-trade live strategies/demo_strategy.py --broker qmt-remote
 ```
 
-## 常用命令速查
+## 6. 这几个参数先不用写
 
-| 场景 | 命令 |
-|------|------|
-| 回测 | `bullet-trade backtest strategy.py --start 2024-01-01 --end 2024-06-01` |
-| 参数优化 | `bullet-trade optimize strategy.py --params params.json --start 2020-01-01 --end 2023-12-31` |
-| 本地实盘 | `bullet-trade live strategy.py --broker qmt` |
-| 远程实盘 | `bullet-trade live strategy.py --broker qmt-remote` |
-| 启动服务 | `bullet-trade server --listen 0.0.0.0 --port 58620 --token secret` |
-| 研究环境 | `bullet-trade lab` |
-| 生成报告 | `bullet-trade report --input backtest_results --format html` |
+如果你只是想先跑通，下面这些先不要写：
 
-## 我应该看哪篇文档？
+- `LOG_DIR`
+- `RUNTIME_DIR`
+- `QMT_ACCOUNT_TYPE`
+- `QMT_SESSION_ID`
+- 风控相关参数，例如 `MAX_ORDER_VALUE`、`MIN_BUY_ORDER_VALUE`
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        你想做什么？                              │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-        ┌───────────────────┼───────────────────┐
-        │                   │                   │
-        ▼                   ▼                   ▼
-┌───────────────┐   ┌───────────────┐   ┌───────────────┐
-│   历史回测     │   │   实盘交易     │   │   研究分析     │
-└───────┬───────┘   └───────┬───────┘   └───────┬───────┘
-        │                   │                   │
-        ▼                   ▼                   ▼
- [回测引擎](backtest.md)    │            [研究环境](research.md)
- [参数优化](optimize.md)    │
-                            │
-            ┌───────────────┼───────────────┐
-            │               │               │
-            ▼               ▼               ▼
-     ┌───────────┐   ┌───────────┐   ┌───────────┐
-     │  本地QMT   │   │  远程QMT   │   │  模拟券商  │
-     └─────┬─────┘   └─────┬─────┘   └─────┬─────┘
-           │               │               │
-           ▼               ▼               ▼
-    [实盘引擎](live.md)  [QMT服务](qmt-server.md)  [实盘引擎](live.md)
+## 7. 常见问题
+
+### `QMT_ACCOUNT_TYPE=stock` 要不要写
+
+不用。  
+默认就是 `stock`。  
+只有期货账户才需要写 `QMT_ACCOUNT_TYPE=future`。
+
+### `--data-path` 为什么报错
+
+因为当前版本没有这个参数。  
+MiniQMT 后端请把数据目录写到 `.env`：
+
+```env
+QMT_DATA_PATH=C:\国金QMT交易端\userdata_mini
 ```
 
-### 文档索引
+大 QMT 后端不使用 `QMT_DATA_PATH`，见 [大 QMT 服务向导](big-qmt-server.md)。
 
-| 需求 | 文档 | 简介 |
-|------|------|------|
-| 环境变量配置 | [配置总览](config.md) | 数据源、券商、风控参数一览 |
-| 回测细节/FAQ | [回测引擎](backtest.md) | 流程、参数、输出说明 |
-| 参数寻优 | [参数优化](optimize.md) | 多进程并行优化 |
-| 本地/远程实盘 | [实盘引擎](live.md) | 生命周期、状态持久化 |
-| 远程 QMT 部署 | [QMT server](qmt-server.md) | 服务端配置详解 |
-| 聚宽模拟盘接入 | [trade-support](trade-support.md) | 远程下单支持 |
-| 数据源配置 | [数据源指南](data/DATA_PROVIDER_GUIDE.md) | JQData/MiniQMT/TuShare |
-| Tick 行情 | [Tick 指南](tick.md) | 订阅、字段、常见问题 |
-| API 参考 | [API 文档](api.md) | 策略可用 API 一览 |
+更多说明：
+
+- [环境准备：先安装 Python，再创建虚拟环境](python-setup.md)
+- [新手入门总览：先选方案，再看对应文档](beginner-guide.md)
+- [方案 A：策略在 BulletTrade 本地直接运行](beginner-route-a.md)
+- [方案 B：策略继续在聚宽侧运行，BulletTrade 负责接收信号并在本地 QMT 执行](beginner-route-b.md)
+- [大 QMT 服务向导](big-qmt-server.md)
+- [配置总览](config.md)
+- [实盘引擎](live.md)
+- [QMT server](qmt-server.md)

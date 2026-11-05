@@ -2,12 +2,14 @@
 
 `MiniQMTProvider` 位于 `bullet_trade/data/providers/miniqmt.py`，用于在本地安装了 mini QMT/xtquant 环境的场景下直接复用行情数据。
 
+本页只说明 MiniQMT/xtquant 直连模式。大 QMT 不是这个 provider 的替代配置，不能只通过 `QMT_DATA_PATH` 接入；大 QMT 需要在大 QMT 策略里运行 helper，再由 `bullet-trade server --server-type big_qmt` 对外提供 `qmt-remote`。完整步骤见 [大 QMT 服务向导](../big-qmt-server.md)。
+
 ## 依赖与配置
 - 依赖官方 `xtquant` 包（通常随 miniQMT 安装提供），未安装时会抛出明确的 ImportError。  
 - 支持的配置/环境变量：
   - `data_dir` / `QMT_DATA_PATH`：显式指定 xtquant 数据目录（`auth` 会调用 `xtdata.set_data_dir`）。`.env.example` 内提供了 Windows 默认安装路径 `C:\国金QMT交易端模拟\userdata_mini` 作为参考。  
   - `mode`：回测 `backtest`（默认）或实盘 `live`，用于控制自动下载等行为，可在初始化参数中传入。  
-  - `auto_download` / `MINIQMT_AUTO_DOWNLOAD`：是否调用 `xtdata.download_history_data`；未指定时回测模式默认开启、实盘模式默认关闭。  
+  - `auto_download` / `MINIQMT_AUTO_DOWNLOAD`：是否调用 `xtdata.download_history_data`；未指定时默认开启，实盘也会主动补齐缺失行情。  
   - `market` / `MINIQMT_MARKET`：交易日市场代码（默认 `SH`）。  
   - `cache_dir` / `DATA_CACHE_DIR`：磁盘缓存目录，若不显式传入则使用 `DATA_CACHE_DIR/miniqmt`；未设置则禁用缓存。  
   - `tushare_token` / `TUSHARE_TOKEN`：xtquant 缺失分红或指数成分时自动回退到 Tushare。
@@ -30,6 +32,14 @@
 - 优先尝试 `xtdata.get_index_stocks`（当版本支持时）。  
 - 若函数不存在或返回空且配置了 `tushare_token`，则自动调用 Tushare 的 `index_weight` 作为后备数据。
 
+## 回测下载去重
+- 默认行为不变：`auto_download` / `MINIQMT_AUTO_DOWNLOAD` 未设置时仍为开启，provider 会按原逻辑调用 `xtdata.download_history_data`。
+- 当用户显式启用回测数据会话时，`mode=backtest` 的 MiniQMTProvider 会在单次回测内按证券、周期和覆盖区间记录已下载数据；覆盖命中后的重复请求会跳过下载，但仍从 QMT 本地数据读取并裁剪请求窗口。
+- 当同时启用回测行情块缓存时，MiniQMTProvider 会按证券、周期和 `dividend_type` 暂存 `xtdata.get_local_data` 返回的本地数据块，后续每日 `count` 窗口只从内存块切片；动态前复权仍用当日 `pre_factor_ref_date` 重新锚定，避免不同参考日串用已锚定价格。
+- 该记录只存在于当前回测进程内，回测结束或异常退出后会清理。`mode=live`、QMT server adapter 和实时行情路径不会读取回测 downloaded 记录，也不会因为回测优化跳过实盘刷新。
+- 回测数据会话不会清理或改写 QMT 官方 xtdata 数据目录，也不会修改用户的 `auto_download` 设置。
+- 如需观测下载次数、覆盖区间和跳过原因，可为回测数据会话配置 manifest 输出。
+
 ## 常见问题
 1. **数据目录权限**：`xtdata.download_history_data` 对安装路径具有写权限要求，建议改为运行在 QMT 安装用户下，或在配置中禁用自动下载并预先同步数据。  
 2. **时区差异**：`xtdata` 返回的时间戳使用毫秒，需要转换为 pandas `datetime`；封装已统一为本地时区，无需额外处理。  
@@ -40,7 +50,7 @@
 - BulletTrade 在 `tests/e2e/data/test_provider_parity.py` 内提供了平安银行 (`000001.XSHE`) 两个派息窗口（2025-06-12、2025-10-15）的 miniQMT 与 JQData 真实数据对齐测试。  
 - 运行前请确保：
   - `.env` 中已设置 `JQDATA_USERNAME`、`JQDATA_PASSWORD`；`QMT_DATA_PATH` 可留空，除非需要覆盖 xtquant 默认目录或为后续交易能力提前配置，若显式配置则需保证路径有效并同步行情；
-  - 推荐开启 `MINIQMT_AUTO_DOWNLOAD=true` 以在数据缺失时自动补齐；
+  - 默认会自动下载补齐缺失行情；如果显式设置 `MINIQMT_AUTO_DOWNLOAD=false`，请先确认本地行情已经预先同步；
   - 已安装 `jqdatasdk` 与 `xtquant`（可通过 `pip install jqdatasdk`、`pip install xtquant` 或 `pip install bullet-trade[qmt]` 完成）。
 - 执行示例：
   ```bash

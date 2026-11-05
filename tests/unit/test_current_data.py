@@ -126,3 +126,22 @@ def test_current_data_uses_minute_after_first_bar(fake_provider):
     current_data = _set_context(datetime(2015, 1, 5, 9, 31))
     data = current_data["000001.XSHE"]
     assert data.last_price == pytest.approx(105.0)
+
+
+def test_limit_fallback_uses_pre_close_instead_of_current_minute_price(monkeypatch):
+    monkeypatch.setattr(data_api, "_resolve_limit_ratio", lambda _security: 0.2)
+    monkeypatch.setattr(data_api, "_fetch_pre_close", lambda *args, **kwargs: 80.0)
+
+    high_limit, low_limit = data_api._apply_limit_fallback(
+        "300394.XSHE",
+        datetime(2025, 5, 30, 14, 50),
+        81.71,
+        0.0,
+        0.0,
+        False,
+        False,
+    )
+
+    assert high_limit == pytest.approx(96.0)
+    assert low_limit == pytest.approx(64.0)
+    assert high_limit != pytest.approx(81.71)

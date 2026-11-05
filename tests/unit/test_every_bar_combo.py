@@ -1,10 +1,10 @@
 """
-测试 every_bar 在分钟回测下的行为
+测试 every_bar 在回测下的行为
 
 测试目标：
 1. every_bar 在分钟回测下按每分钟触发
-2. every_bar 在日回测下按每天触发一次
-3. every_bar 与 every_minute 在分钟回测下等价
+2. every_bar 在日回测下也按每分钟触发，保持回测与实盘一致
+3. every_bar 与 every_minute 等价
 4. 分钟边界验证（09:31、11:30、13:01、15:00）
 5. 周期触发验证（周三 10:00、月首 10:00）
 """
@@ -103,9 +103,10 @@ class TestEveryBarMinuteFrequency:
         for boundary in boundaries:
             assert boundary in schedule, f"边界时间 {boundary} 应该在调度表中"
     
-    def test_every_bar_equals_every_minute_in_minute_frequency(self):
-        """every_bar 与 every_minute 在分钟回测下等价"""
-        set_option('backtest_frequency', 'minute')
+    @pytest.mark.parametrize('frequency', ['minute', 'day', 'daily', '1d'])
+    def test_every_bar_equals_every_minute(self, frequency):
+        """every_bar 与 every_minute 在常见回测频率写法下等价"""
+        set_option('backtest_frequency', frequency)
         
         # 注册两个任务
         run_daily(lambda ctx: None, 'every_bar')
@@ -131,8 +132,8 @@ class TestEveryBarMinuteFrequency:
 class TestEveryBarDayFrequency:
     """测试 every_bar 在日回测下的行为"""
     
-    def test_every_bar_triggers_once_per_day_in_day_frequency(self):
-        """every_bar 在日回测下每天只触发一次"""
+    def test_every_bar_triggers_every_minute_in_day_frequency(self):
+        """every_bar 在日回测下也按交易分钟触发"""
         # 设置日回测频率
         set_option('backtest_frequency', 'day')
         
@@ -147,9 +148,10 @@ class TestEveryBarDayFrequency:
             if any(task.time == 'every_bar' for task in tasks)
         ]
         
-        # 验证：只触发一次，且为开盘时刻
-        assert len(every_bar_times) == 1
+        # 验证：日频回测下仍与实盘 every_bar 语义一致，按交易分钟触发
+        assert len(every_bar_times) == 240
         assert every_bar_times[0] == dt.datetime(2025, 6, 2, 9, 30)
+        assert every_bar_times[-1] == dt.datetime(2025, 6, 2, 14, 59)
 
 
 class TestPeriodicTriggers:
@@ -245,9 +247,10 @@ class TestTimeExpressionResolve:
         
         times = expr.resolve(trade_day, periods)
         
-        # 应该只返回开盘时刻
-        assert len(times) == 1
+        # 应该返回所有交易分钟，与实盘 every_bar 语义一致
+        assert len(times) == 240
         assert times[0] == dt.datetime(2025, 6, 2, 9, 30)
+        assert times[-1] == dt.datetime(2025, 6, 2, 14, 59)
     
     def test_every_minute_always_returns_all_minutes(self):
         """every_minute 应该总是返回所有分钟，不受频率影响"""

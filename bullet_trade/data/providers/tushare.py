@@ -29,6 +29,7 @@ class TushareProvider(DataProvider):
             fallback_to_env=not cache_dir_set,
         )
         self._pro = None
+        self._asset_type_cache: Dict[str, str] = {}
 
     # ------------------------ 公共工具 ------------------------
     @classmethod
@@ -84,11 +85,36 @@ class TushareProvider(DataProvider):
         freq = frequency.lower()
         if freq in ("daily", "1d", "d"):
             return "D"
-        if freq in ("minute", "1m", "m1"):
+        if freq in ("minute", "1m", "m1", "1min"):
             return "1min"
+        if freq.endswith("min"):
+            return freq
+        if freq.endswith("m") and freq[:-1].isdigit():
+            return f"{int(freq[:-1])}min"
         if freq.endswith("m"):
             return f"{freq}"
         return freq.upper()
+
+    @staticmethod
+    def _is_minute_frequency(freq: str) -> bool:
+        return "min" in str(freq).lower()
+
+    def _normalize_price_units(self, df: pd.DataFrame, freq: str, asset: Optional[str]) -> pd.DataFrame:
+        """
+        统一到聚宽兼容口径：volume=股，money=元。
+
+        Tushare 的日/周/月线 A 股、指数、基金行情使用 volume=手、money=千元；
+        股票分钟线 stk_mins 已经是 volume=股、money=元，不需要转换。
+        """
+        if self._is_minute_frequency(freq):
+            return df
+        if asset not in {"E", "I", "FD"}:
+            return df
+        if "volume" in df.columns:
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce").astype(float) * 100.0
+        if "money" in df.columns:
+            df["money"] = pd.to_numeric(df["money"], errors="coerce").astype(float) * 1000.0
+        return df
 
     def _apply_fields(self, df: pd.DataFrame, fields: Optional[List[str]]) -> pd.DataFrame:
         if fields:
@@ -98,6 +124,62 @@ class TushareProvider(DataProvider):
                 df = df.assign(**extra_cols)
             df = df[fields]
         return df
+
+    @classmethod
+    def _infer_asset_by_code(cls, security: str) -> Optional[str]:
+        jq_code = cls._to_jq_code(security)
+        if not jq_code or "." not in jq_code:
+            return None
+
+        code, suffix = jq_code.split(".", 1)
+        suffix = suffix.upper()
+
+        if suffix == "XSHG":
+            if code.startswith("000"):
+                return "I"
+            if code.startswith("5"):
+                return "FD"
+            if code.startswith("6"):
+                return "E"
+        elif suffix == "XSHE":
+            if code.startswith("399"):
+                return "I"
+            if code.startswith(("15", "16", "18")):
+                return "FD"
+            if code.startswith(("000", "001", "002", "003", "300", "301")):
+                return "E"
+
+        return None
+
+    def _infer_asset_from_catalog(self, jq_code: str) -> Optional[str]:
+        for types, asset in (
+            (["index"], "I"),
+            (["fund", "etf", "lof"], "FD"),
+            (["stock"], "E"),
+        ):
+            try:
+                df = self.get_all_securities(types=types)
+            except Exception:
+                continue
+            if df is not None and not df.empty and jq_code in df.index:
+                return asset
+        return None
+
+    def _infer_asset(self, security: str) -> str:
+        jq_code = self._to_jq_code(security)
+        cache_key = jq_code.upper() if isinstance(jq_code, str) else str(jq_code)
+        cached = self._asset_type_cache.get(cache_key)
+        if cached:
+            return cached
+
+        asset = self._infer_asset_by_code(jq_code)
+        if asset is None:
+            asset = self._infer_asset_from_catalog(jq_code)
+        if asset is None:
+            asset = "E"
+
+        self._asset_type_cache[cache_key] = asset
+        return asset
 
     # ------------------------ 认证 ------------------------
     def auth(
@@ -140,6 +222,7 @@ class TushareProvider(DataProvider):
         frames: Dict[str, pd.DataFrame] = {}
 
         for sec in securities:
+            asset = self._infer_asset(sec)
             kwargs = {
                 "security": sec,
                 "start_date": start_date,
@@ -150,6 +233,7 @@ class TushareProvider(DataProvider):
                 "fq": fq,
                 "count": count,
                 "pre_factor_ref_date": pre_factor_ref_date,
+                "asset": asset,
             }
 
             def _fetch_single(kw: Dict[str, Any]) -> pd.DataFrame:
@@ -163,6 +247,7 @@ class TushareProvider(DataProvider):
                     fq=kw.get("fq"),
                     count=kw.get("count"),
                     pre_factor_ref_date=kw.get("pre_factor_ref_date"),
+                    asset=kw.get("asset"),
                 )
 
             frames[sec] = self._cache.cached_call("get_price", kwargs, _fetch_single, result_type="df")
@@ -192,13 +277,14 @@ class TushareProvider(DataProvider):
         fq: Optional[str],
         count: Optional[int],
         pre_factor_ref_date: Optional[Union[str, datetime]],
+        asset: Optional[str] = None,
     ) -> pd.DataFrame:
         start_str = self._format_date(start_date)
         end_str = self._format_date(end_date)
         freq = self._normalize_frequency(frequency)
         ts = self._ensure_ts_module()
         pro = self._ensure_client()
-        asset = "E"  # 默认股票
+        asset = asset or self._infer_asset(security)
         ts_code = self._to_ts_code(security)
 
         df = ts.pro_bar(
@@ -213,8 +299,9 @@ class TushareProvider(DataProvider):
         if df is None or df.empty:
             return pd.DataFrame()
 
-        df = df.sort_values("trade_date")
-        df.index = pd.to_datetime(df["trade_date"])
+        time_col = "trade_time" if self._is_minute_frequency(freq) and "trade_time" in df.columns else "trade_date"
+        df = df.sort_values(time_col)
+        df.index = pd.to_datetime(df[time_col])
         df.rename(
             columns={
                 "vol": "volume",
@@ -228,11 +315,12 @@ class TushareProvider(DataProvider):
             df["ts_code"] = df["ts_code"].apply(self._to_jq_code)
         df["money"] = df.get("money", 0.0)
         df["volume"] = df.get("volume", 0.0)
+        df = self._normalize_price_units(df, freq, asset)
 
         if skip_paused and "is_paused" in df.columns:
             df = df[df["is_paused"] == 0]
 
-        if fq in ("pre", "post"):
+        if asset == "E" and fq in ("pre", "post"):
             df = self._apply_adjustment(
                 security=security,
                 df=df,
@@ -266,7 +354,9 @@ class TushareProvider(DataProvider):
             return fallback if not fallback.empty else df
 
         factor_df.index = pd.to_datetime(factor_df["trade_date"]).dt.normalize()
-        merged = df.join(factor_df["adj_factor"], how="left")
+        merged = df.copy()
+        merged["_factor_date"] = pd.to_datetime(merged.index).normalize()
+        merged = merged.join(factor_df["adj_factor"], on="_factor_date", how="left")
         merged["adj_factor"] = merged["adj_factor"].ffill().bfill()
         ref_date = pre_factor_ref_date
         if ref_date is None and fq == "pre":
@@ -297,7 +387,7 @@ class TushareProvider(DataProvider):
             if col in merged.columns:
                 merged[col] = merged[col] * ratio
 
-        merged.drop(columns=["adj_factor"], inplace=True, errors="ignore")
+        merged.drop(columns=["adj_factor", "_factor_date"], inplace=True, errors="ignore")
         return merged
 
     def _build_adjusted_from_events(
@@ -671,7 +761,8 @@ class TushareProvider(DataProvider):
             pro = self._ensure_client()
             # 回退策略：使用 pro.bar/ts.pro_bar 获取最近一分钟数据
             ts_code = self._to_ts_code(security)
-            df = ts.pro_bar(ts_code=ts_code, freq='1min', api=pro)
+            asset = self._infer_asset(security)
+            df = ts.pro_bar(ts_code=ts_code, freq='1min', asset=asset, api=pro)
             if df is None or df.empty:
                 return {}
             df = df.sort_values('trade_time' if 'trade_time' in df.columns else 'trade_date')

@@ -6,9 +6,11 @@
 
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 from datetime import datetime, date
 import pandas as pd
+
+from .futures_account import LONG, SHORT, FuturesAccount
 
 
 class OrderStatus(Enum):
@@ -25,28 +27,180 @@ class OrderStatus(Enum):
     - rejected: 废单/拒绝（最终态）
     - held: 挂起
     """
-    new = 'new'
-    open = 'open'
-    filling = 'filling'
-    partly_canceled = 'partly_canceled'
-    canceling = 'canceling'
-    filled = 'filled'
-    canceled = 'canceled'
-    rejected = 'rejected'
-    held = 'held'
+
+    new = "new"
+    open = "open"
+    filling = "filling"
+    partly_canceled = "partly_canceled"
+    canceling = "canceling"
+    filled = "filled"
+    canceled = "canceled"
+    rejected = "rejected"
+    held = "held"
+
+
+class CompatOrderStatus:
+    """兼容口径的订单状态别名集合。
+
+    属性直接指向原生枚举成员，因此与引擎写入的 order.status 比较结果一致。
+    差异只在 held：该口径下 held 表示订单已完成，对应原生 filled；
+    原生 held（挂起）不在此暴露，避免两种语义混用。
+    """
+
+    new = OrderStatus.new
+    open = OrderStatus.open
+    filling = OrderStatus.filling
+    partly_canceled = OrderStatus.partly_canceled
+    canceling = OrderStatus.canceling
+    filled = OrderStatus.filled
+    canceled = OrderStatus.canceled
+    rejected = OrderStatus.rejected
+    held = OrderStatus.filled
 
 
 class OrderStyle(Enum):
     """下单方式枚举"""
-    market = 'market'  # 市价单
-    limit = 'limit'  # 限价单
+
+    market = "market"  # 市价单
+    limit = "limit"  # 限价单
+
+
+def security_code_aliases(security: Optional[str]) -> List[str]:
+    """
+    Return compatible security-code aliases for position lookups.
+
+    BulletTrade strategy code commonly uses JoinQuant suffixes (XSHG/XSHE),
+    while broker/V2/QMT snapshots may use exchange suffixes (SH/SZ). Position
+    containers must allow either spelling to find the same position without
+    storing duplicate rows.
+    """
+
+    if security is None:
+        return []
+    text = str(security).strip()
+    if not text:
+        return []
+    if "." not in text:
+        return [text]
+
+    code, suffix = text.rsplit(".", 1)
+    suffix_upper = suffix.upper()
+    candidates = [text, f"{code}.{suffix_upper}"]
+    if suffix_upper == "SH":
+        candidates.append(f"{code}.XSHG")
+    elif suffix_upper == "XSHG":
+        candidates.append(f"{code}.SH")
+    elif suffix_upper == "SZ":
+        candidates.append(f"{code}.XSHE")
+    elif suffix_upper == "XSHE":
+        candidates.append(f"{code}.SZ")
+
+    result: List[str] = []
+    seen = set()
+    for item in candidates:
+        if item and item not in seen:
+            result.append(item)
+            seen.add(item)
+    return result
+
+
+_MISSING = object()
+
+
+class SecurityPositionMap(dict):
+    """
+    Dict-like position map with SH/SZ and XSHG/XSHE alias lookup.
+
+    The map stores only one key per actual position. Alias support applies to
+    lookup, membership, deletion, pop and setdefault, so backtest and live code
+    can safely use either QMT-style or JoinQuant-style suffixes.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__()
+        if args or kwargs:
+            self.update(*args, **kwargs)
+
+    def _resolve_existing_key(self, key: Any) -> Any:
+        if dict.__contains__(self, key):
+            return key
+        if isinstance(key, str):
+            for alias in security_code_aliases(key):
+                if dict.__contains__(self, alias):
+                    return alias
+        return key
+
+    def __contains__(self, key: object) -> bool:
+        if dict.__contains__(self, key):
+            return True
+        if isinstance(key, str):
+            return any(dict.__contains__(self, alias) for alias in security_code_aliases(key))
+        return False
+
+    def __getitem__(self, key: Any) -> Any:
+        resolved = self._resolve_existing_key(key)
+        if not dict.__contains__(self, resolved):
+            raise KeyError(key)
+        return dict.__getitem__(self, resolved)
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        resolved = self._resolve_existing_key(key)
+        dict.__setitem__(self, resolved, value)
+
+    def __delitem__(self, key: Any) -> None:
+        resolved = self._resolve_existing_key(key)
+        if not dict.__contains__(self, resolved):
+            raise KeyError(key)
+        dict.__delitem__(self, resolved)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        resolved = self._resolve_existing_key(key)
+        if dict.__contains__(self, resolved):
+            return dict.__getitem__(self, resolved)
+        return default
+
+    def pop(self, key: Any, default: Any = _MISSING) -> Any:
+        resolved = self._resolve_existing_key(key)
+        if dict.__contains__(self, resolved):
+            return dict.pop(self, resolved)
+        if default is _MISSING:
+            raise KeyError(key)
+        return default
+
+    def setdefault(self, key: Any, default: Any = None) -> Any:
+        resolved = self._resolve_existing_key(key)
+        if dict.__contains__(self, resolved):
+            return dict.__getitem__(self, resolved)
+        dict.__setitem__(self, key, default)
+        return default
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        items: Dict[Any, Any] = {}
+        if args:
+            if len(args) > 1:
+                raise TypeError("update expected at most 1 positional argument")
+            other = args[0]
+            if hasattr(other, "keys"):
+                items.update({key: other[key] for key in other.keys()})
+            else:
+                for key, value in other:
+                    items[key] = value
+        items.update(kwargs)
+        for key, value in items.items():
+            self[key] = value
+
+
+def ensure_security_position_map(value: Any) -> SecurityPositionMap:
+    if isinstance(value, SecurityPositionMap):
+        return value
+    return SecurityPositionMap(value or {})
 
 
 @dataclass
 class Position:
     """
     持仓标的信息
-    
+
     Attributes:
         security: 标的代码
         total_amount: 总持仓
@@ -56,7 +210,10 @@ class Position:
         acc_avg_cost: 累计平均成本
         value: 市值
         side: 多空方向 ('long' or 'short')
+        buy_time: 当前这轮持仓首次建仓时间
+        last_buy_time: 最近一次买入/加仓时间
     """
+
     security: str
     total_amount: int = 0
     closeable_amount: int = 0
@@ -64,19 +221,21 @@ class Position:
     price: float = 0.0
     acc_avg_cost: float = 0.0
     value: float = 0.0
-    side: str = 'long'
+    side: str = "long"
+    buy_time: Optional[datetime] = None
+    last_buy_time: Optional[datetime] = None
     # 当日买入但受 T+1 限制的数量（次日释放为可卖）
     today_buy_t1: int = 0
-    
+
     def update_price(self, price: float):
         """更新当前价格和市值"""
         self.price = price
         self.value = self.total_amount * price
-        
+
     def update_position(self, amount: int, cost: float):
         """
         更新持仓
-        
+
         Args:
             amount: 交易数量（正数买入，负数卖出）
             cost: 成交价格
@@ -104,7 +263,7 @@ class Position:
 class SubPortfolio:
     """
     子账户信息
-    
+
     Attributes:
         type: 账户类型
         available_cash: 可用资金
@@ -113,13 +272,17 @@ class SubPortfolio:
         positions: 持仓字典
         positions_value: 持仓市值
     """
-    type: str = 'stock'  # stock/futures
+
+    type: str = "stock"  # stock/futures
     available_cash: float = 0.0
     transferable_cash: float = 0.0
     total_value: float = 0.0
-    positions: Dict[str, Position] = field(default_factory=dict)
+    positions: Dict[str, Position] = field(default_factory=SecurityPositionMap)
     positions_value: float = 0.0
-    
+
+    def __post_init__(self):
+        self.positions = ensure_security_position_map(self.positions)
+
     def update_value(self):
         """更新账户总价值"""
         self.positions_value = sum(pos.value for pos in self.positions.values())
@@ -130,7 +293,7 @@ class SubPortfolio:
 class Portfolio:
     """
     总账户信息
-    
+
     Attributes:
         total_value: 总资产
         available_cash: 可用资金
@@ -141,44 +304,139 @@ class Portfolio:
         positions_value: 持仓市值
         subportfolios: 子账户字典
     """
+
     total_value: float = 100000.0
     available_cash: float = 100000.0
     transferable_cash: float = 100000.0
     locked_cash: float = 0.0
     starting_cash: float = 100000.0
-    positions: Dict[str, Position] = field(default_factory=dict)
+    positions: Dict[str, Position] = field(default_factory=SecurityPositionMap)
     positions_value: float = 0.0
     subportfolios: Dict[str, SubPortfolio] = field(default_factory=dict)
-    
+    # 期货账本；为 None 时组合完全是股票/基金口径，权益计算与历史行为一致
+    futures_account: Optional[FuturesAccount] = None
+
     # 风险指标
     returns: float = 0.0  # 当日收益
     daily_returns: float = 0.0  # 当日收益率
-    
+
     def __post_init__(self):
         """初始化子账户"""
+        self.positions = ensure_security_position_map(self.positions)
         if not self.subportfolios:
-            self.subportfolios['stock'] = SubPortfolio(
-                type='stock',
+            self.subportfolios["stock"] = SubPortfolio(
+                type="stock",
                 available_cash=self.available_cash,
                 transferable_cash=self.transferable_cash,
-                total_value=self.total_value
+                total_value=self.total_value,
             )
-    
+        else:
+            for subportfolio in self.subportfolios.values():
+                try:
+                    subportfolio.positions = ensure_security_position_map(subportfolio.positions)
+                except Exception:
+                    pass
+
+    @property
+    def futures_margin(self) -> float:
+        """返回期货占用保证金合计。
+
+        Returns:
+            float: 无期货账本时为 0。
+        """
+
+        return self.futures_account.margin if self.futures_account is not None else 0.0
+
+    @property
+    def futures_floating_pnl(self) -> float:
+        """返回期货盯市浮动盈亏合计（相对上一结算价）。
+
+        Returns:
+            float: 无期货账本时为 0。
+        """
+
+        if self.futures_account is None:
+            return 0.0
+        return self.futures_account.mark_to_market_pnl
+
+    @property
+    def long_positions(self) -> Dict[str, Any]:
+        """返回多头持仓视图，键为标的代码。
+
+        Returns:
+            Dict[str, Any]: 股票多头 Position 与期货多头 FuturesPosition 的合并视图。
+        """
+
+        result: Dict[str, Any] = {
+            security: position
+            for security, position in self.positions.items()
+            if getattr(position, "side", LONG) == LONG
+        }
+        if self.futures_account is not None:
+            for position in self.futures_account.iter_positions():
+                if position.side == LONG:
+                    result[position.security] = position
+        return result
+
+    @property
+    def short_positions(self) -> Dict[str, Any]:
+        """返回空头持仓视图，键为标的代码。
+
+        Returns:
+            Dict[str, Any]: 股票空头 Position 与期货空头 FuturesPosition 的合并视图。
+        """
+
+        result: Dict[str, Any] = {
+            security: position
+            for security, position in self.positions.items()
+            if getattr(position, "side", LONG) == SHORT
+        }
+        if self.futures_account is not None:
+            for position in self.futures_account.iter_positions():
+                if position.side == SHORT:
+                    result[position.security] = position
+        return result
+
     def update_value(self):
         """更新账户总价值"""
         self.positions_value = sum(pos.value for pos in self.positions.values())
-        self.total_value = self.available_cash + self.positions_value + self.locked_cash
-        
+        futures_value = 0.0
+        if self.futures_account is not None:
+            # 期货以占用保证金计入持仓价值，浮动项按盯市口径单独加入权益
+            self.positions_value += self.futures_account.margin
+            futures_value = self.futures_account.mark_to_market_pnl
+        self.total_value = (
+            self.available_cash + self.positions_value + self.locked_cash + futures_value
+        )
+
         # 更新子账户
         for subportfolio in self.subportfolios.values():
             subportfolio.update_value()
+
+        self._sync_futures_subportfolio()
+
+    def _sync_futures_subportfolio(self) -> None:
+        """把期货账本口径同步到 futures 子账户，供策略按子账户读取。
+
+        Returns:
+            None: 无期货账本或无 futures 子账户时不做任何事。
+        """
+
+        if self.futures_account is None:
+            return
+        subportfolio = self.subportfolios.get("futures")
+        if subportfolio is None:
+            return
+        subportfolio.available_cash = self.futures_account.cash
+        subportfolio.positions_value = self.futures_account.margin
+        subportfolio.total_value = self.futures_account.total_value
 
 
 @dataclass
 class Trade:
     """
     订单的一次交易记录
-    
+
     Attributes:
         order_id: 订单ID
         security: 标的代码
@@ -188,7 +446,11 @@ class Trade:
         commission: 手续费
         tax: 印花税
         trade_id: 成交记录ID
+        action: 期货开平标记，旧记录为 None
+        side: 期货持仓方向，旧记录为 None
+        multiplier: 本次期货成交使用的实际合约乘数，旧记录为 None
     """
+
     order_id: str
     security: str
     amount: int
@@ -197,13 +459,21 @@ class Trade:
     commission: float = 0.0
     tax: float = 0.0
     trade_id: str = ""
+    action: Optional[str] = None
+    side: Optional[str] = None
+    multiplier: Optional[float] = None
+    realized_pnl_gross: Optional[float] = None
+    realized_pnl_net: Optional[float] = None
+    allocated_entry_fees: Optional[float] = None
+    allocated_distributions: Optional[float] = None
+    pnl_basis_status: Optional[str] = None
 
 
 @dataclass
 class Order:
     """
     买卖订单信息
-    
+
     Attributes:
         order_id: 订单ID
         security: 标的代码
@@ -214,9 +484,15 @@ class Order:
         add_time: 下单时间
         is_buy: 是否买入
         action: 交易类型（'open' or 'close'）
+        side: 开仓方向（'long' or 'short'）；股票恒为 'long'
+        pindex: 平仓优先级，0 表示先平昨仓再平今仓，1 表示先平今仓
+        close_today: 是否按平今费率计费；仅对期货平仓有意义
         style: 下单方式
         extra: 扩展字段（券商特有信息，如备注/策略名）
+        avg_cost: 买入/开仓时为成交均价；卖出/平仓时为本笔成交前的持仓成本
+        commission: 本笔订单产生的交易费用合计（佣金、税费等）
     """
+
     order_id: str
     security: str
     amount: int
@@ -225,17 +501,22 @@ class Order:
     status: OrderStatus = OrderStatus.open
     add_time: Optional[datetime] = None
     is_buy: bool = True
-    action: str = 'open'
+    action: str = "open"
+    side: str = "long"
+    pindex: int = 0
+    close_today: bool = False
     style: object = OrderStyle.market
     wait_timeout: Optional[float] = None
     extra: Dict[str, Any] = field(default_factory=dict)
+    avg_cost: float = 0.0
+    commission: float = 0.0
 
 
 @dataclass
 class SecurityUnitData:
     """
     单个标的的行情数据
-    
+
     Attributes:
         security: 标的代码
         last_price: 最新价
@@ -243,20 +524,51 @@ class SecurityUnitData:
         low_limit: 跌停价
         paused: 是否停牌
         is_st: 是否ST
+        source_time: 行情源时间；实时源无法证明时为 None
+        received_time: BulletTrade 接收快照的时间
+        age_seconds: 接收时相对行情源时间的秒数
+        source: 行情来源稳定标识
+        bid_price1: 买一价；行情源未提供时为 None
+        ask_price1: 卖一价；行情源未提供时为 None
+        bid_volume1: 买一量；行情源未提供时为 None
+        ask_volume1: 卖一量；行情源未提供时为 None
+        day_open: 当日开盘价；行情源未提供或当前为分钟 bar 时为 0.0
+        query_completed_time: 行情查询完成时间；行情源未提供时为 None
+        feed_health: 行情源健康证据；行情源未提供时为 None
     """
+
     security: str
     last_price: float = 0.0
     high_limit: float = 0.0
     low_limit: float = 0.0
     paused: bool = False
     is_st: bool = False
+    source_time: Optional[datetime] = None
+    received_time: Optional[datetime] = None
+    age_seconds: Optional[float] = None
+    source: Optional[str] = None
+    bid_price1: Optional[float] = None
+    ask_price1: Optional[float] = None
+    bid_volume1: Optional[float] = None
+    ask_volume1: Optional[float] = None
+    name: str = ""
+    display_name: str = ""
+    price_tick: float = 0.01
+    day_trading: bool = False
+    day_open: float = 0.0
+    query_completed_time: Optional[datetime] = None
+    feed_health: Optional[Dict[str, Any]] = None
+
+    @property
+    def is_paused(self) -> bool:
+        return self.paused
 
 
 @dataclass
 class Context:
     """
     策略信息总览
-    
+
     Attributes:
         portfolio: 账户信息
         current_dt: 当前时间
@@ -265,12 +577,13 @@ class Context:
         run_params: 运行参数
         subportfolios: 子账户
     """
+
     portfolio: Portfolio
     current_dt: datetime
     previous_dt: Optional[datetime] = None
     previous_date: Optional[date] = None
     run_params: Dict[str, Any] = field(default_factory=dict)
-    
+
     @property
     def subportfolios(self):
         """获取子账户"""

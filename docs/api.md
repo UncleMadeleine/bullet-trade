@@ -34,11 +34,11 @@
 
 ## 调度与时间表达式 {#schedule}
 支持与聚宽一致的定时接口，时间表达式已扩展了常用别名：
-- `run_daily(func, time='every_bar')`：日调度。`every_bar` 在分钟回测每分钟执行，在日回测只在开盘触发；`every_minute` 强制每分钟；`'HH:MM'`/`'HH:MM:SS'` 为指定时刻；相对表达式 `open`/`open-30m`/`close+10s`；内置别名 `before_open=open-30m`、`after_close=close+30m`、`morning=08:00`、`night=20:00`。
+- `run_daily(func, time='every_bar')`：日调度。`every_bar` 在回测与实盘中都按交易时段每分钟 bar 触发；`every_minute` 与其等价且语义更直白；`'HH:MM'`/`'HH:MM:SS'` 为指定时刻；相对表达式 `open`/`open-30m`/`close+10s`；内置别名 `before_open=open-30m`、`after_close=close+30m`、`morning=08:00`、`night=20:00`。
 - `run_weekly(func, weekday, time='09:30', reference_security=None, force=True)`：`weekday` 表示当周第 N 个交易日（支持负数，-1 为最后一个交易日）；`force=True` 时以回测/策略起始日为第 1 个交易日补跑首周，`force=False` 则从自然周第一个交易日起算，过期不补；`reference_security` 影响交易日/交易时段判定。
 - `run_monthly(func, monthday, time='09:30', reference_security=None, force=True)`：`monthday` 表示当月第 N 个交易日（支持负数，-1 为最后一个交易日）；`force=True` 超界时就近取当月最后一个交易日，`force=False` 则跳过。
 - `unschedule_all()`：清空所有已注册任务。
-- 差异提示：`every_bar` 在日频回测只触发一次（开盘），与聚宽相同；我们额外允许通过 `.env` 或 `set_option('time_aliases', {...})` 覆写别名。
+- 差异提示：为保持回测与实盘一致，`every_bar` 不再随回测 `frequency` 退化为每天一次；如只希望每天执行一次，请使用 `time='open'` 或具体时刻。我们额外允许通过 `.env` 或 `set_option('time_aliases', {...})` 覆写别名。
 
 ## 风控与设置 {#risk-settings}
 - `set_benchmark(security)`：设置基准标的（如 `000300.XSHG`），用于报告与回测对比。
@@ -73,18 +73,28 @@
 
 ## 订单与组合 {#orders-portfolio}
 - 下单/撤单函数（与聚宽同名）：  
-  - `order(security, amount, price=None, style=None, wait_timeout=None)`：按股数下单；`amount>0` 买入，`<0` 卖出；`style=LimitOrderStyle(price)` 显式限价；仅传 `price` 默认视为市价单带保护价（`MarketOrderStyle(limit_price=price)`）。  
-  - `order_value(security, value, price=None, style=None, wait_timeout=None)`：按金额下单，数量在撮合时根据价差计算；传 `price` 同样默认市价+保护价，限价需用 `LimitOrderStyle`。  
+  - `order(security, amount, price=None, style=None, wait_timeout=None)`：按股数下单；`amount>0` 买入，`<0` 卖出；仅传 `price` 或 `style=LimitOrderStyle(price)` 都表示显式限价单；市价保护单需显式使用 `MarketOrderStyle(limit_price=price)`。  
+  - `order_value(security, value, price=None, style=None, wait_timeout=None)`：按金额下单，数量在撮合时根据价格计算；传 `price` 同样表示限价单。  
   - `order_target(security, amount, price=None, style=None, wait_timeout=None)`：将持仓调整到目标股数；价格参数同上。  
-  - `order_target_value(security, value, price=None, style=None, wait_timeout=None)`：将持仓调整到目标市值；价格参数同上。  
-  - `cancel_order(order_or_id)`：撤单；若订单仍在本地队列直接移除，否则尝试用券商订单号撤券商。  
-  - `cancel_all_orders()`：撤销本地队列所有订单。  
+  - `order_target_value(security, value, price=None, style=None, wait_timeout=None)`：将持仓调整到目标市值；价格参数同上。
+  - `cancel_order(order_or_id)`：撤单；若订单仍在本地队列直接移除，否则尝试用券商订单号撤券商。
+  - `cancel_all_orders()`：撤销本地队列所有订单。
+
+  > **`wait_timeout` 参数说明（仅实盘生效）**
+  >
+  > | 值 | 行为 |
+  > |---|------|
+  > | `None`（默认） | 使用全局配置 `TRADE_MAX_WAIT_TIME`，默认 **16 秒**同步等待 |
+  > | `> 0`（如 `10`） | 同步等待指定秒数，超时后返回 |
+  > | `0` | 异步模式，立即返回订单对象，由后台跟踪 |
+  >
+  > 回测模式下此参数无效，下单即撮合。
   - `get_open_orders()`：返回当日未完成订单字典，`key=order_id`，`value=Order` 快照；未完成状态包含 `new/open/filling/canceling`。  
   - `get_orders(order_id=None, security=None, status=None, from_broker=False)`：返回当日订单字典，支持按订单号/标的/状态过滤；`status` 支持 `OrderStatus` 或字符串值；`from_broker=False`（默认）时返回引擎视角订单，`from_broker=True` 时返回券商侧全量订单快照（含人工/外部委托）。  
   - `get_trades(order_id=None, security=None)`：返回当日成交字典，`key=trade_id`，`value=Trade` 快照；一个订单可对应多笔成交。  
   - 默认 `set_option('order_match_mode', 'immediate')` 时创建即撮合；否则在 bar 结束批量撮合。
 - 价格样式：`MarketOrderStyle(limit_price=None, buy_price_percent=None, sell_price_percent=None)`（市价，可选保护价或价差系数，实盘会带保护价并传 `market=True`）；`LimitOrderStyle(price)`（限价）。
-- 回测撮合：无论市价/限价，成交价按滑点优先级应用（`ref` > `type` > `all` > 旧全局设置 > `security_overrides`/默认 0.00246/2）；保护价/限价仅用于资金检查和接受条件，不直接决定成交价；货币基金强制 0 滑点。
+- 回测撮合：先用当前 bar 价格判断限价/保护价是否可成交，再按滑点优先级应用（`ref` > `type` > `all` > 旧全局设置 > `security_overrides`/默认 0.00246/2）；最终成交价会被限价/保护价、涨跌停与价格笼子共同约束；货币基金强制 0 滑点。
 - 成本/滑点：`OrderCost`、`FixedSlippage` 同上。
 
 <a id="tick-subscription"></a>

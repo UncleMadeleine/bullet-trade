@@ -74,9 +74,13 @@ def _disable_engine_default_slippage(monkeypatch, request):
     if request.node.get_closest_marker("requires_network") is not None:
         yield
         return
+
     def _no_default_slip(self, price: float, is_buy: bool, security: str) -> float:
         return price
-    monkeypatch.setattr(BacktestEngine, "_calc_trade_price_with_default_slippage", _no_default_slip, raising=True)
+
+    monkeypatch.setattr(
+        BacktestEngine, "_calc_trade_price_with_default_slippage", _no_default_slip, raising=True
+    )
     yield
 
 
@@ -219,7 +223,9 @@ class ReferenceProvider(DataProvider):
         days = pd.bdate_range(sd, ed, freq="C")  # custom business days近似
         return [pd.Timestamp(d).to_pydatetime() for d in days]
 
-    def get_all_securities(self, types: Union[str, List[str]] = "stock", date: Optional[Union[str, datetime]] = None) -> pd.DataFrame:
+    def get_all_securities(
+        self, types: Union[str, List[str]] = "stock", date: Optional[Union[str, datetime]] = None
+    ) -> pd.DataFrame:
         idx = []
         if types in ("stock", ["stock"]):
             idx = ["601318.XSHG"]
@@ -229,7 +235,9 @@ class ReferenceProvider(DataProvider):
         df.index.name = "code"
         return df
 
-    def get_index_stocks(self, index_symbol: str, date: Optional[Union[str, datetime]] = None) -> List[str]:
+    def get_index_stocks(
+        self, index_symbol: str, date: Optional[Union[str, datetime]] = None
+    ) -> List[str]:
         return []
 
     def get_split_dividend(
@@ -250,6 +258,8 @@ class ReferenceProvider(DataProvider):
         # 明确标的分类，避免引擎侧默认分类为 stock 造成取整/费用误差
         if security == "511880.XSHG":
             return {"type": "fund", "subtype": "money_market_fund", "display_name": "货币基金示例"}
+        if security == "512670.XSHG":
+            return {"type": "etf", "subtype": "fund", "display_name": "除权后买入 ETF 示例"}
         if security == "601318.XSHG":
             return {"type": "stock", "display_name": "中国平安示例"}
         return {}
@@ -260,34 +270,39 @@ def _setup_engine(provider: DataProvider, start: str, end: str) -> BacktestEngin
     data_api.set_data_provider(provider)
     # 强制关闭分类默认滑点，确保成交价完全由基准价决定
     try:
-        data_api.set_security_overrides({
-            "by_category": {
-                "stock": {"slippage": 0.0},
-                "fund": {"slippage": 0.0},
-                "money_market_fund": {"slippage": 0.0},
-            },
-            "by_prefix": {
-                # 将 511 前缀归类为货币基金，避免默认按 stock 处理
-                "511": "money_market_fund",
-            },
-            "by_code": {
-                # 明确 511880 为货币基金（双保险）
-                "511880.XSHG": {"category": "money_market_fund"},
-            },
-        })
+        data_api.set_security_overrides(
+            {
+                "by_category": {
+                    "stock": {"slippage": 0.0},
+                    "fund": {"slippage": 0.0},
+                    "money_market_fund": {"slippage": 0.0},
+                },
+                "by_prefix": {
+                    # 将 511 前缀归类为货币基金，避免默认按 stock 处理
+                    "511": "money_market_fund",
+                },
+                "by_code": {
+                    # 明确 511880 为货币基金（双保险）
+                    "511880.XSHG": {"category": "money_market_fund"},
+                },
+            }
+        )
     except Exception:
         pass
 
     # 策略：在 initialize 内设置滑点/费用（避免被引擎 reset_settings() 覆盖）并下单
     def initialize(context):
         from jqdata import set_benchmark, run_daily
+
         set_benchmark("000300.XSHG")
 
         # 关闭滑点，保证精确复现目标价格
         set_slippage(FixedSlippage(0.0))
         # 设置费用：股票卖出 close_commission=0.0013，以匹配 71.16 手续费；基金免手续费
         set_order_cost(
-            OrderCost(open_commission=0.0003, close_commission=0.0013, close_tax=0.0, min_commission=5.0),
+            OrderCost(
+                open_commission=0.0003, close_commission=0.0013, close_tax=0.0, min_commission=5.0
+            ),
             type="stock",
         )
         set_order_cost(
@@ -299,10 +314,12 @@ def _setup_engine(provider: DataProvider, start: str, end: str) -> BacktestEngin
             d = ctx.current_dt.date()
             if d == Date(2024, 7, 10):
                 from jqdata import order
+
                 order("511880.XSHG", 400)  # 基金：成交 100.973
                 order("601318.XSHG", 1200)  # 股票：成交 41.120
             if d == Date(2025, 1, 10):
                 from jqdata import order
+
                 order("511880.XSHG", -300)  # 成交 100.111
                 order("601318.XSHG", -1100)  # 成交 49.760
 
@@ -322,6 +339,110 @@ def _assert_trade(record, code: str, amount: int, price: float, commission: floa
     assert record.amount == amount
     assert abs(record.price - price) < 1e-6
     assert abs(record.commission - commission) < 1e-2
+
+
+def _make_512670_provider(action: Dict[str, Any]) -> ReferenceProvider:
+    """构造 512670.XSHG 权益事件回归测试用离线数据源。
+
+    参数:
+        action: 待注入的分红/拆分事件。
+
+    返回值:
+        ReferenceProvider: 已注入 512670 行情和权益事件的离线数据源。
+
+    副作用:
+        无。
+    """
+
+    provider = ReferenceProvider()
+    provider.daily["512670.XSHG"] = {
+        "2024-08-19": {"open": 1.00, "close": 1.00},
+        "2024-08-20": {"open": 0.50, "close": 0.50},
+        "2024-08-21": {"open": 0.51, "close": 0.51},
+        "2024-08-22": {"open": 0.50, "close": 0.51},
+        "2024-08-23": {"open": 0.52, "close": 0.52},
+    }
+    provider.dividends["512670.XSHG"] = [action]
+    return provider
+
+
+def _run_512670_order_scenario(
+    provider: ReferenceProvider,
+    *,
+    start: str,
+    end: str,
+    orders_by_date: Dict[Date, List[int]],
+) -> BacktestEngine:
+    """运行 512670.XSHG 单标的权益事件回归场景。
+
+    参数:
+        provider: 离线数据源。
+        start: 回测开始日期。
+        end: 回测结束日期。
+        orders_by_date: 按日期配置的下单数量列表。
+
+    返回值:
+        BacktestEngine: 已运行完成的回测引擎。
+
+    副作用:
+        设置当前数据源，并执行回测。
+    """
+
+    data_api.set_data_provider(provider)
+
+    def initialize(context):
+        """初始化 ETF 权益事件回归策略。
+
+        参数:
+            context: 回测上下文。
+
+        返回值:
+            无。
+
+        副作用:
+            注册每日开盘下单任务，并设置无滑点、基金零费用。
+        """
+
+        from jqdata import order, run_daily, set_benchmark
+
+        set_benchmark("000300.XSHG")
+        set_slippage(FixedSlippage(0.0))
+        set_order_cost(
+            OrderCost(
+                open_commission=0.0,
+                close_commission=0.0,
+                close_tax=0.0,
+                min_commission=0.0,
+            ),
+            type="fund",
+        )
+
+        def trade(ctx):
+            """按日期执行测试订单。
+
+            参数:
+                ctx: 回测上下文。
+
+            返回值:
+                无。
+
+            副作用:
+                在指定日期提交 512670.XSHG 买卖订单。
+            """
+
+            for amount in orders_by_date.get(ctx.current_dt.date(), []):
+                order("512670.XSHG", amount)
+
+        run_daily(trade, time="open")
+
+    engine = BacktestEngine(
+        initialize=initialize,
+        start_date=start,
+        end_date=end,
+        initial_cash=100000,
+    )
+    engine.run()
+    return engine
 
 
 @pytest.mark.unit
@@ -345,6 +466,7 @@ def test_reference_trades_match_prices_and_fees():
     finally:
         data_api.reset_security_overrides()
 
+
 @pytest.mark.unit
 def test_reference_dividends_match_events():
     provider = ReferenceProvider()
@@ -353,7 +475,16 @@ def test_reference_dividends_match_events():
     events = eng.events
     # 预期三条：07-26（601318），10-18（601318），12-31（511880）
     # 使用简要断言：code, event_date, cash_in, per_base
-    found = [(e.get("code"), e.get("event_date"), round(float(e.get("cash_in") or 0.0), 2), e.get("per_base")) for e in events if e.get("event_type") == "现金分红"]
+    found = [
+        (
+            e.get("code"),
+            e.get("event_date"),
+            round(float(e.get("cash_in") or 0.0), 2),
+            e.get("per_base"),
+        )
+        for e in events
+        if e.get("event_type") == "现金分红"
+    ]
     expected = [
         ("601318.XSHG", Date(2024, 7, 26), 1440.00, 10),
         ("601318.XSHG", Date(2024, 10, 18), 892.80, 10),
@@ -362,6 +493,271 @@ def test_reference_dividends_match_events():
     # 由于 run 范围到 12-31，只要三条都出现即可
     for exp in expected:
         assert exp in found
+
+
+@pytest.mark.unit
+def test_split_event_on_position_buy_time_is_not_applied():
+    """验证除权日当天买入的 ETF 持仓不会重复应用当日拆分事件。
+
+    参数:
+        无。
+
+    返回值:
+        无。
+
+    副作用:
+        使用 ReferenceProvider 运行离线回测，验证同日买入不参与拆分。
+    """
+
+    provider = _make_512670_provider(
+        {
+            "security": "512670.XSHG",
+            "date": Date(2024, 8, 20),
+            "security_type": "etf",
+            "scale_factor": 2.0,
+            "bonus_pre_tax": 0.0,
+            "per_base": 1,
+        }
+    )
+    engine = _run_512670_order_scenario(
+        provider,
+        start="2024-08-20",
+        end="2024-08-21",
+        orders_by_date={Date(2024, 8, 20): [1000], Date(2024, 8, 21): [-1000]},
+    )
+
+    assert [(trade.security, trade.amount) for trade in engine.trades] == [
+        ("512670.XSHG", 1000),
+        ("512670.XSHG", -1000),
+    ]
+    assert not [event for event in engine.events if event.get("event_type") == "拆分/送转"]
+    assert "512670.XSHG" not in engine.context.portfolio.positions
+
+
+@pytest.mark.unit
+def test_split_event_before_position_buy_time_is_applied_once():
+    """验证除权日前已持有的 ETF 持仓仍会正常应用拆分事件。
+
+    参数:
+        无。
+
+    返回值:
+        无。
+
+    副作用:
+        使用 ReferenceProvider 运行离线回测，验证符合资格的持仓被拆分一次。
+    """
+
+    provider = _make_512670_provider(
+        {
+            "security": "512670.XSHG",
+            "date": Date(2024, 8, 20),
+            "security_type": "etf",
+            "scale_factor": 2.0,
+            "bonus_pre_tax": 0.0,
+            "per_base": 1,
+        }
+    )
+    engine = _run_512670_order_scenario(
+        provider,
+        start="2024-08-19",
+        end="2024-08-20",
+        orders_by_date={Date(2024, 8, 19): [1000]},
+    )
+
+    split_events = [event for event in engine.events if event.get("event_type") == "拆分/送转"]
+    assert len(split_events) == 1
+    assert split_events[0]["old_amount"] == 1000
+    assert split_events[0]["new_amount"] == 2000
+    assert engine.context.portfolio.positions["512670.XSHG"].total_amount == 2000
+
+
+@pytest.mark.unit
+def test_cash_dividend_event_on_position_buy_time_is_not_applied():
+    """验证除息日当天买入的 ETF 持仓不会获得当日现金分红。
+
+    参数:
+        无。
+
+    返回值:
+        无。
+
+    副作用:
+        使用 ReferenceProvider 运行离线回测，验证同日买入不参与现金分红。
+    """
+
+    provider = _make_512670_provider(
+        {
+            "security": "512670.XSHG",
+            "date": Date(2024, 8, 20),
+            "security_type": "etf",
+            "scale_factor": 1.0,
+            "bonus_pre_tax": 0.10,
+            "per_base": 1,
+        }
+    )
+    engine = _run_512670_order_scenario(
+        provider,
+        start="2024-08-20",
+        end="2024-08-21",
+        orders_by_date={Date(2024, 8, 20): [1000], Date(2024, 8, 21): [-1000]},
+    )
+
+    assert not [event for event in engine.events if event.get("event_type") == "现金分红"]
+    assert [(trade.security, trade.amount) for trade in engine.trades] == [
+        ("512670.XSHG", 1000),
+        ("512670.XSHG", -1000),
+    ]
+
+
+@pytest.mark.unit
+def test_initial_position_after_split_date_does_not_replay_old_event():
+    """验证除权后注入的初始持仓不会回放历史拆分事件。
+
+    参数:
+        无。
+
+    返回值:
+        无。
+
+    副作用:
+        使用 ReferenceProvider 运行离线回测，验证 initial_positions 的事件资格。
+    """
+
+    provider = _make_512670_provider(
+        {
+            "security": "512670.XSHG",
+            "date": Date(2024, 8, 20),
+            "security_type": "etf",
+            "scale_factor": 2.0,
+            "bonus_pre_tax": 0.0,
+            "per_base": 1,
+        }
+    )
+    data_api.set_data_provider(provider)
+
+    def initialize(context):
+        """初始化无交易策略。
+
+        参数:
+            context: 回测上下文。
+
+        返回值:
+            无。
+
+        副作用:
+            设置回测基准。
+        """
+
+        from jqdata import set_benchmark
+
+        set_benchmark("000300.XSHG")
+
+    engine = BacktestEngine(
+        initialize=initialize,
+        start_date="2024-08-22",
+        end_date="2024-08-22",
+        initial_cash=100000,
+        initial_positions=[{"security": "512670.XSHG", "amount": 1000, "avg_cost": 0.50}],
+    )
+    engine.run()
+
+    assert not [event for event in engine.events if event.get("event_type") == "拆分/送转"]
+    position = engine.context.portfolio.positions["512670.XSHG"]
+    assert position.total_amount == 1000
+    assert position.buy_time.date() == Date(2024, 8, 22)
+
+
+@pytest.mark.unit
+def test_split_event_before_position_buy_time_is_not_applied():
+    """验证除权日之后才买入的 ETF 持仓不会重复应用历史拆分事件。
+
+    参数:
+        无。
+
+    返回值:
+        无。
+
+    副作用:
+        使用 ReferenceProvider 运行一段离线回测，验证成交和事件列表。
+    """
+
+    provider = ReferenceProvider()
+    provider.daily["512670.XSHG"] = {
+        "2024-08-20": {"open": 0.50, "close": 0.50},
+        "2024-08-22": {"open": 0.50, "close": 0.51},
+        "2024-08-23": {"open": 0.52, "close": 0.52},
+    }
+    provider.dividends["512670.XSHG"] = [
+        {
+            "security": "512670.XSHG",
+            "date": Date(2024, 8, 20),
+            "security_type": "etf",
+            "scale_factor": 2.0,
+            "bonus_pre_tax": 0.0,
+            "per_base": 1,
+        }
+    ]
+    data_api.set_data_provider(provider)
+
+    def initialize(context):
+        """初始化测试策略。
+
+        参数:
+            context: 回测上下文。
+
+        返回值:
+            无。
+
+        副作用:
+            注册每日开盘买卖任务，并设置无滑点、基金零费用。
+        """
+
+        from jqdata import order, run_daily, set_benchmark
+
+        set_benchmark("000300.XSHG")
+        set_slippage(FixedSlippage(0.0))
+        set_order_cost(
+            OrderCost(open_commission=0.0, close_commission=0.0, close_tax=0.0, min_commission=0.0),
+            type="fund",
+        )
+
+        def trade(ctx):
+            """按日期执行 ETF 买卖。
+
+            参数:
+                ctx: 回测上下文。
+
+            返回值:
+                无。
+
+            副作用:
+                2024-08-22 买入，2024-08-23 卖出。
+            """
+
+            day = ctx.current_dt.date()
+            if day == Date(2024, 8, 22):
+                order("512670.XSHG", 1000)
+            if day == Date(2024, 8, 23):
+                order("512670.XSHG", -1000)
+
+        run_daily(trade, time="open")
+
+    try:
+        engine = BacktestEngine(
+            initialize=initialize,
+            start_date="2024-08-22",
+            end_date="2024-08-23",
+            initial_cash=100000,
+        )
+        engine.run()
+        assert [(trade.security, trade.amount) for trade in engine.trades] == [
+            ("512670.XSHG", 1000),
+            ("512670.XSHG", -1000),
+        ]
+        assert not [event for event in engine.events if event.get("event_type") == "拆分/送转"]
+    finally:
+        data_api.reset_security_overrides()
 
 
 @pytest.mark.requires_network
@@ -396,10 +792,13 @@ def test_live_provider_trades_and_dividends_match_reference(provider_name):
 
     def initialize(context):
         from jqdata import set_benchmark, run_daily
+
         set_benchmark("000300.XSHG")
         set_slippage(FixedSlippage(0.0))
         set_order_cost(
-            OrderCost(open_commission=0.0003, close_commission=0.0013, close_tax=0.0, min_commission=5.0),
+            OrderCost(
+                open_commission=0.0003, close_commission=0.0013, close_tax=0.0, min_commission=5.0
+            ),
             type="stock",
         )
         set_order_cost(
@@ -411,10 +810,12 @@ def test_live_provider_trades_and_dividends_match_reference(provider_name):
             d = ctx.current_dt.date()
             if d == Date(2024, 7, 10):
                 from jqdata import order
+
                 order("511880.XSHG", 400)
                 order("601318.XSHG", 1200)
             if d == Date(2025, 1, 10):
                 from jqdata import order
+
                 order("511880.XSHG", -300)
                 order("601318.XSHG", -1100)
 
@@ -448,32 +849,52 @@ def test_live_provider_trades_and_dividends_match_reference(provider_name):
         step = 0.001 if cat in ("fund", "money_market_fund") else 0.01
         ticks = price / step
         import math
+
         ticks_rounded = math.floor(ticks + 0.5)
         return round(ticks_rounded * step, 3 if step == 0.001 else 2)
 
     def fen(x: float) -> float:
         from decimal import Decimal, ROUND_HALF_UP
-        return float(Decimal(str(x)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+
+        return float(Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
     def expected_price(code: str, dt: datetime) -> float:
         t = dt.time()
         if t >= Time(9, 25) and t < Time(9, 31):
             # 先尝试 09:30 分钟，否则回退到日开
             try:
-                dfm = data_api.get_price(code, start_date=dt.replace(hour=9, minute=25), end_date=dt, frequency='minute', fields=['close'], fq='none', count=None)
+                dfm = data_api.get_price(
+                    code,
+                    start_date=dt.replace(hour=9, minute=25),
+                    end_date=dt,
+                    frequency="minute",
+                    fields=["close"],
+                    fq="none",
+                    count=None,
+                )
             except Exception:
                 dfm = pd.DataFrame()
             if isinstance(dfm, pd.DataFrame) and not dfm.empty and dt in dfm.index:
-                base = float(dfm.loc[dt]['close'])
+                base = float(dfm.loc[dt]["close"])
             else:
-                dfd = data_api.get_price(code, end_date=dt, frequency='daily', fields=['open'], fq='none', count=1)
-                base = float(dfd.iloc[-1]['open']) if not dfd.empty else 0.0
+                dfd = data_api.get_price(
+                    code, end_date=dt, frequency="daily", fields=["open"], fq="none", count=1
+                )
+                base = float(dfd.iloc[-1]["open"]) if not dfd.empty else 0.0
         elif t >= Time(9, 31) and t < Time(15, 0):
-            dfm = data_api.get_price(code, end_date=dt, frequency='minute', fields=['close'], fq='none', count=1)
-            base = float(dfm.iloc[-1]['close']) if (isinstance(dfm, pd.DataFrame) and not dfm.empty) else 0.0
+            dfm = data_api.get_price(
+                code, end_date=dt, frequency="minute", fields=["close"], fq="none", count=1
+            )
+            base = (
+                float(dfm.iloc[-1]["close"])
+                if (isinstance(dfm, pd.DataFrame) and not dfm.empty)
+                else 0.0
+            )
         else:
-            dfd = data_api.get_price(code, end_date=dt, frequency='daily', fields=['close'], fq='none', count=1)
-            base = float(dfd.iloc[-1]['close']) if not dfd.empty else 0.0
+            dfd = data_api.get_price(
+                code, end_date=dt, frequency="daily", fields=["close"], fq="none", count=1
+            )
+            base = float(dfd.iloc[-1]["close"]) if not dfd.empty else 0.0
         cat = infer_category(code)
         return round_to_tick(base, cat)
 
@@ -495,5 +916,9 @@ def test_live_provider_trades_and_dividends_match_reference(provider_name):
         dt = tr.time
         price_exp = expected_price(code, dt)
         comm_exp = expected_commission(code, tr.amount, price_exp)
-        assert abs(tr.price - price_exp) < 1e-6, f"{code} price mismatch: got {tr.price}, exp {price_exp} at {dt}"
-        assert abs(tr.commission - comm_exp) < 1e-2, f"{code} commission mismatch: got {tr.commission}, exp {comm_exp} at {dt}"
+        assert (
+            abs(tr.price - price_exp) < 1e-6
+        ), f"{code} price mismatch: got {tr.price}, exp {price_exp} at {dt}"
+        assert (
+            abs(tr.commission - comm_exp) < 1e-2
+        ), f"{code} commission mismatch: got {tr.commission}, exp {comm_exp} at {dt}"

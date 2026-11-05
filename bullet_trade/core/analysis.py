@@ -6,7 +6,9 @@
 
 from typing import Dict, Any, Optional, Sequence, List
 import json
+import math
 from datetime import datetime
+from functools import lru_cache
 import warnings
 
 try:
@@ -44,6 +46,114 @@ _TRADE_KEY_ALIASES: Dict[str, Sequence[str]] = {
 }
 
 
+@lru_cache(maxsize=None)
+def _resolve_supported_offset_alias(*candidates: str) -> str:
+    if pd is None:
+        return candidates[0]
+    for alias in candidates:
+        try:
+            pd.date_range("2000-01-01", periods=1, freq=alias)
+            return alias
+        except Exception:
+            continue
+    return candidates[0]
+
+
+_YEAR_END_FREQ = _resolve_supported_offset_alias("YE", "Y")
+_MONTH_END_FREQ = _resolve_supported_offset_alias("ME", "M")
+
+
+def _merge_meta_dict(base: Optional[Dict[str, Any]], overlay: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = dict(base or {})
+    for key, value in (overlay or {}).items():
+        if key not in merged or merged.get(key) in (None, "", {}, []):
+            merged[key] = value
+    return merged
+
+
+def _last_valid_number(series: Optional[pd.Series]) -> Optional[float]:
+    if series is None:
+        return None
+    try:
+        clean = pd.to_numeric(series, errors="coerce").dropna()
+    except Exception:
+        return None
+    if clean.empty:
+        return None
+    return float(clean.iloc[-1])
+
+
+def _compute_benchmark_context(
+    df: pd.DataFrame,
+    *,
+    base_value: Optional[float] = None,
+) -> Dict[str, Any]:
+    empty = {
+        "benchmark_value": None,
+        "benchmark_returns_pct": None,
+        "excess_returns_pct": None,
+        "benchmark_total_returns_pct": None,
+        "benchmark_annual_returns_pct": None,
+        "excess_total_returns_pct": None,
+    }
+    if df is None or df.empty:
+        return empty
+
+    def _numeric_series(column: str) -> Optional[pd.Series]:
+        if column not in df.columns:
+            return None
+        series = pd.to_numeric(df[column], errors="coerce")
+        if series.dropna().empty:
+            return None
+        return series
+
+    base = base_value
+    if base is None or base <= 0:
+        try:
+            base = float(pd.to_numeric(df["total_value"], errors="coerce").dropna().iloc[0])
+        except Exception:
+            base = None
+
+    strategy_returns_pct = _numeric_series("returns_pct")
+    if strategy_returns_pct is None and base and base > 0 and "total_value" in df.columns:
+        strategy_total_value = pd.to_numeric(df["total_value"], errors="coerce")
+        strategy_returns_pct = (strategy_total_value / float(base) - 1.0) * 100.0
+
+    benchmark_returns_pct = _numeric_series("benchmark_returns_pct")
+    benchmark_value = _numeric_series("benchmark_value")
+    if benchmark_returns_pct is None and benchmark_value is not None and base and base > 0:
+        benchmark_returns_pct = (benchmark_value / float(base) - 1.0) * 100.0
+    elif benchmark_value is None and benchmark_returns_pct is not None and base and base > 0:
+        benchmark_value = float(base) * (1.0 + benchmark_returns_pct / 100.0)
+
+    excess_returns_pct = _numeric_series("excess_returns_pct")
+    if excess_returns_pct is None and strategy_returns_pct is not None and benchmark_returns_pct is not None:
+        excess_returns_pct = strategy_returns_pct - benchmark_returns_pct
+
+    benchmark_total_returns_pct = _last_valid_number(benchmark_returns_pct)
+    excess_total_returns_pct = _last_valid_number(excess_returns_pct)
+
+    benchmark_annual_returns_pct: Optional[float] = None
+    if benchmark_value is not None:
+        clean = pd.to_numeric(benchmark_value, errors="coerce").dropna()
+        trading_days = len(clean)
+        years = trading_days / 250.0
+        benchmark_base = float(base) if base and base > 0 else float(clean.iloc[0])
+        if trading_days > 0 and years > 0 and benchmark_base > 0:
+            benchmark_annual_returns_pct = (
+                pow(float(clean.iloc[-1]) / benchmark_base, 1 / years) - 1
+            ) * 100.0
+
+    return {
+        "benchmark_value": benchmark_value,
+        "benchmark_returns_pct": benchmark_returns_pct,
+        "excess_returns_pct": excess_returns_pct,
+        "benchmark_total_returns_pct": benchmark_total_returns_pct,
+        "benchmark_annual_returns_pct": benchmark_annual_returns_pct,
+        "excess_total_returns_pct": excess_total_returns_pct,
+    }
+
+
 def _get_trade_attr(trade: Any, key: str, default: Any = None) -> Any:
     """兼容对象与字典格式的交易记录字段获取。"""
     if isinstance(trade, dict):
@@ -52,6 +162,17 @@ def _get_trade_attr(trade: Any, key: str, default: Any = None) -> Any:
                 return trade[alias]
         return default
     return getattr(trade, key, default)
+
+
+def _initial_equity_value(df: pd.DataFrame, initial_value: Any = None) -> float:
+    """优先使用已记录的初始总资产，旧结果回退至首日总资产。"""
+    try:
+        value = float(initial_value)
+        if math.isfinite(value) and value > 0:
+            return value
+    except (TypeError, ValueError):
+        pass
+    return float(df['total_value'].iloc[0])
 
 
 def _ensure_plot_fonts():
@@ -79,6 +200,7 @@ def plot_results(results: Dict[str, Any], save_path: str = None, show_plots: boo
     """
     _ensure_plot_fonts()
     df = results['daily_records']
+    initial_value = _initial_equity_value(df, results.get('meta', {}).get('initial_total_value'))
     
     # 创建图表
     fig, axes = plt.subplots(4, 1, figsize=(28, 24), constrained_layout=True)
@@ -87,11 +209,11 @@ def plot_results(results: Dict[str, Any], save_path: str = None, show_plots: boo
     # 1. 资产曲线
     ax1 = axes[0]
     ax1.plot(df.index, df['total_value'], label='策略净值', linewidth=2, color='#1f77b4')
-    ax1.axhline(y=float(str(results['summary']['初始资金']).replace(',', '')), 
+    ax1.axhline(y=initial_value,
                 color='red', linestyle='--', alpha=0.5, label='初始资金')
     # 1.1 回撤（右轴）合并到净值图
     ax1b = ax1.twinx()
-    cummax = df['total_value'].expanding().max()
+    cummax = df['total_value'].expanding().max().clip(lower=initial_value)
     drawdown = (df['total_value'] - cummax) / cummax * 100
     ax1b.fill_between(df.index, drawdown, 0, alpha=0.3, color='#d62728', label='回撤 (%)')
     ax1b.plot(df.index, drawdown, linewidth=2, color='darkred')
@@ -110,8 +232,8 @@ def plot_results(results: Dict[str, Any], save_path: str = None, show_plots: boo
     
     # 标注Top5最大回撤区间（峰到谷）
     intervals = []
-    peak_idx = 0
-    peak_val = float(df['total_value'].iloc[0])
+    peak_idx = None
+    peak_val = initial_value
     min_dd = 0.0
     min_idx = 0
     for i, v in enumerate(df['total_value'].values):
@@ -133,13 +255,14 @@ def plot_results(results: Dict[str, Any], save_path: str = None, show_plots: boo
     intervals.sort(key=lambda x: x[2])
     intervals = intervals[:5]
     for (p_idx, t_idx, ddv) in intervals:
-        start = df.index[p_idx]
+        start = df.index[p_idx] if p_idx is not None else df.index[0]
         end = df.index[t_idx]
         # 在净值曲线与回撤曲线上高亮区间
         ax1.axvspan(start, end, color='#d62728', alpha=0.3)
         ax1b.axvspan(start, end, color='#d62728', alpha=0.3)
         dd_val_pct = ddv * 100.0
-        txt = f"{abs(dd_val_pct):.2f}%\n{start.date()} → {end.date()}"
+        start_label = str(start.date()) if p_idx is not None else "初始资金"
+        txt = f"{abs(dd_val_pct):.2f}%\n{start_label} → {end.date()}"
         y = float(drawdown.iloc[t_idx])
         ax1b.annotate(txt, xy=(end, y), xytext=(end, y + 5), textcoords='data',
                       arrowprops=dict(arrowstyle='->', color='black', alpha=0.6),
@@ -147,7 +270,7 @@ def plot_results(results: Dict[str, Any], save_path: str = None, show_plots: boo
     
     # 2. 收益率曲线
     ax2 = axes[1]
-    cumulative_returns = (df['total_value'] / df['total_value'].iloc[0] - 1) * 100
+    cumulative_returns = (df['total_value'] / initial_value - 1) * 100
     ax2.plot(df.index, cumulative_returns, label='累计收益率', linewidth=2, color='#d62728')
     ax2.axhline(y=0, color='red', linestyle='--', alpha=0.5)
     ax2.set_ylabel('收益率 (%)', fontsize=12)
@@ -228,17 +351,38 @@ def plot_positions(results: Dict[str, Any], save_path: str = None, show_plots: b
         plt.close(fig)
 
 
-def _compute_trade_win_stats(trades: List[Dict[str, Any]]) -> Dict[str, float]:
-    """按成交（卖出）口径统计交易胜率与次数。"""
-    # 统一访问器
-    def _ga(obj, key, default=None):
-        try:
-            return getattr(obj, key)
-        except Exception:
-            return obj.get(key, default) if isinstance(obj, dict) else default
+_SPEC_TABLE_FOR_MULTIPLIER = None
 
-    def _normalize_trade_time(value):
-        """将各种时间格式统一为可比较的字符串，避免排序报错。"""
+
+def _trade_multiplier(security: str, multiplier: Optional[float] = None) -> float:
+    """优先使用成交保存的乘数；旧格式仅允许解析已知规格。"""
+    global _SPEC_TABLE_FOR_MULTIPLIER
+    if multiplier is not None:
+        value = float(multiplier)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("成交乘数必须为有限正数")
+        return value
+
+    from .futures_account import ContractSpecTable, is_futures_security
+
+    if not security or not is_futures_security(security):
+        return 1.0
+    if _SPEC_TABLE_FOR_MULTIPLIER is None:
+        _SPEC_TABLE_FOR_MULTIPLIER = ContractSpecTable()
+    try:
+        value = float(_SPEC_TABLE_FOR_MULTIPLIER.multiplier(security))
+    except Exception as exc:
+        raise ValueError("历史期货成交缺少可解析乘数: {0}".format(security)) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("历史期货成交乘数必须为有限正数: {0}".format(security))
+    return value
+
+
+def _closed_trade_pnls(trades: List[Dict[str, Any]]) -> List[float]:
+    """按已平成交计算盈亏，期货按方向隔离并分摊开仓费用。"""
+    from .futures_account import is_futures_security
+
+    def normalized_time(value):
         if value is None:
             return None
         if isinstance(value, pd.Timestamp):
@@ -246,145 +390,153 @@ def _compute_trade_win_stats(trades: List[Dict[str, Any]]) -> Dict[str, float]:
         if isinstance(value, datetime):
             return value.isoformat(sep=' ')
         try:
-            ts = pd.to_datetime(value, errors='coerce')
+            timestamp = pd.to_datetime(value, errors='coerce')
         except Exception:
             return str(value)
-        if pd.isna(ts):
-            return str(value)
-        return ts.isoformat()
+        return str(value) if pd.isna(timestamp) else timestamp.isoformat()
 
-    # 排序确保时间顺序
-    enumerated_trades = list(enumerate(trades or []))
+    def sort_key(item):
+        index, trade = item
+        timestamp = normalized_time(_get_trade_attr(trade, 'time'))
+        return (timestamp is None, timestamp or '', index)
 
-    def _sort_key(item):
-        idx, trade = item
-        normalized = _normalize_trade_time(_ga(trade, 'time'))
-        return (normalized is None, normalized or '', idx)
-
-    enumerated_trades.sort(key=_sort_key)
-    sorted_trades = [trade for _, trade in enumerated_trades]
-    # 按标的维护仓位均价
-    state: Dict[str, Dict[str, float]] = {}
-    def st(code: str):
-        if code not in state:
-            state[code] = {'qty': 0.0, 'avg': 0.0}
-        return state[code]
-
-    win = 0
-    loss = 0
-    for t in sorted_trades:
-        code = _ga(t, 'security')
+    states = {}
+    pnls = []
+    warned_legacy = False
+    warned_legacy_equity = False
+    annotated_equity_codes = {
+        _get_trade_attr(trade, 'security')
+        for trade in trades or []
+        if isinstance(_get_trade_attr(trade, 'pnl_basis_status'), str)
+        and not is_futures_security(_get_trade_attr(trade, 'security') or '')
+    }
+    for _, trade in sorted(enumerate(trades or []), key=sort_key):
+        code = _get_trade_attr(trade, 'security')
         if not code:
             continue
-        s = st(code)
-        amt = float(_ga(t, 'amount', 0) or 0)
-        price = float(_ga(t, 'price', 0) or 0)
-        commission = float(_ga(t, 'commission', 0) or 0)
-        tax = float(_ga(t, 'tax', 0) or 0)
-        if amt > 0:
-            total = s['avg'] * s['qty'] + price * amt
-            s['qty'] = s['qty'] + amt
-            s['avg'] = (total / s['qty']) if s['qty'] > 0 else 0.0
-        elif amt < 0:
-            sell_qty = abs(amt)
-            pnl = (price - s['avg']) * sell_qty - commission - tax
-            if pnl > 1e-12:
-                win += 1
-            elif pnl < -1e-12:
-                loss += 1
-            s['qty'] = max(0.0, s['qty'] - sell_qty)
+        amount = float(_get_trade_attr(trade, 'amount', 0) or 0)
+        price = float(_get_trade_attr(trade, 'price', 0) or 0)
+        commission = float(_get_trade_attr(trade, 'commission', 0) or 0)
+        tax = float(_get_trade_attr(trade, 'tax', 0) or 0)
+        futures = is_futures_security(code)
+        pnl_status = _get_trade_attr(trade, 'pnl_basis_status')
+        if isinstance(pnl_status, float) and math.isnan(pnl_status):
+            pnl_status = None
+        if not futures and pnl_status is not None:
+            if amount < 0:
+                recorded_pnl = _get_trade_attr(trade, 'realized_pnl_net')
+                if (pnl_status == 'corporate_actions_and_fees' and recorded_pnl is not None
+                        and math.isfinite(float(recorded_pnl))):
+                    pnls.append(float(recorded_pnl))
+                else:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('always', RuntimeWarning)
+                        warnings.warn("平仓成本证据不完整，已从交易胜率中排除: {0}".format(code), RuntimeWarning)
+            continue
+        if not futures and code in annotated_equity_codes:
+            if amount < 0:
+                with warnings.catch_warnings():
+                    warnings.simplefilter('always', RuntimeWarning)
+                    warnings.warn(
+                        "同一标的混合新旧损益证据，旧平仓记录已排除: {0}".format(code),
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+            continue
+        if not futures and amount < 0 and not warned_legacy_equity:
+            with warnings.catch_warnings():
+                warnings.simplefilter('always', RuntimeWarning)
+                warnings.warn(
+                    "历史现金证券成交缺少公司行动和入场费用证据，沿用旧统计口径",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            warned_legacy_equity = True
+        metadata = tuple(_get_trade_attr(trade, key) for key in ('action', 'side', 'multiplier'))
+        if all(value is None or (isinstance(value, float) and math.isnan(value)) for value in metadata):
+            metadata = (None, None, None)
+        explicit_futures = futures and any(value is not None for value in metadata)
+        side = 'long'
+        action = 'open' if amount > 0 else 'close'
+        multiplier = 1.0
+        if futures:
+            if not all(math.isfinite(value) for value in (amount, price, commission, tax)):
+                raise ValueError("期货成交包含非有限数值: {0}".format(code))
+            if explicit_futures:
+                action, side, multiplier = metadata
+                if action not in ('open', 'close') or side not in ('long', 'short') or multiplier is None:
+                    raise ValueError("期货成交必须同时包含有效 action、side、multiplier: {0}".format(code))
+                multiplier = _trade_multiplier(code, multiplier)
+                expected_buy = (action == 'open') == (side == 'long')
+                if amount != 0 and (amount > 0) != expected_buy:
+                    raise ValueError("期货成交数量符号与开平方向不一致: {0}".format(code))
+            else:
+                if not warned_legacy:
+                    # 分析模块既有全局警告过滤不应掩盖历史格式的证据边界。
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('always', RuntimeWarning)
+                        warnings.warn(
+                            "历史期货成交缺少开平和方向，仅按纯多头格式兼容统计；空头无法据此还原",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                    warned_legacy = True
+                multiplier = _trade_multiplier(code)
+        if amount == 0:
+            continue
+        state = states.setdefault((code, side), {'qty': 0.0, 'avg': 0.0, 'fees': 0.0, 'explicit': explicit_futures})
+        if state['qty'] and state['explicit'] != explicit_futures:
+            raise ValueError("同一持仓不能混用缺失元数据和完整元数据的成交: {0}".format(code))
+        state['explicit'] = explicit_futures
+        quantity = abs(amount)
+        if action == 'open':
+            # 完整期货成交保存每手名义成本，避免统计重新查询或猜测乘数。
+            unit_cost = price * multiplier if explicit_futures else price
+            total_cost = state['avg'] * state['qty'] + unit_cost * quantity
+            state['qty'] += quantity
+            state['avg'] = total_cost / state['qty']
+            if explicit_futures:
+                state['fees'] += commission + tax
+        else:
+            if futures and quantity > state['qty']:
+                raise ValueError("期货平仓成交超过已知同向开仓数量，无法还原盈亏: {0}".format(code))
+            if explicit_futures:
+                opening_fees = state['fees'] * quantity / state['qty']
+                direction = 1.0 if side == 'long' else -1.0
+                pnl = direction * (price * multiplier - state['avg']) * quantity
+                pnl -= opening_fees + commission + tax
+                state['fees'] -= opening_fees
+            else:
+                # 股票与已存纯多头结果继续沿用仅扣平仓费用的历史口径。
+                pnl = (price - state['avg']) * quantity * multiplier - commission - tax
+            pnls.append(pnl)
+            state['qty'] = max(0.0, state['qty'] - quantity)
+            if not state['qty']:
+                state['fees'] = 0.0
+    return pnls
 
+
+def _compute_trade_win_stats(trades: List[Dict[str, Any]]) -> Dict[str, float]:
+    """按已平成交统计交易胜率与次数。"""
+    pnls = _closed_trade_pnls(trades)
+    win = sum(pnl > 1e-12 for pnl in pnls)
+    loss = sum(pnl < -1e-12 for pnl in pnls)
     total = win + loss
-    win_rate = (win / total * 100.0) if total > 0 else 0.0
     return {
-        '交易胜率': win_rate,
+        '交易胜率': (win / total * 100.0) if total else 0.0,
         '交易盈利次数': win,
         '交易亏损次数': loss,
     }
 
 
 def _compute_trade_profit_loss_ratio(trades: List[Dict[str, Any]]) -> float:
-    """
-    计算基于交易的盈亏比（聚宽公式：总盈利额 / 总亏损额）。
-    
-    按卖出成交计算每笔交易的盈亏，汇总后计算比率。
-    """
-    # 统一访问器
-    def _ga(obj, key, default=None):
-        try:
-            return getattr(obj, key)
-        except Exception:
-            return obj.get(key, default) if isinstance(obj, dict) else default
-
-    def _normalize_trade_time(value):
-        if value is None:
-            return None
-        if isinstance(value, pd.Timestamp):
-            return value.isoformat()
-        if isinstance(value, datetime):
-            return value.isoformat(sep=' ')
-        try:
-            ts = pd.to_datetime(value, errors='coerce')
-        except Exception:
-            return str(value)
-        if pd.isna(ts):
-            return str(value)
-        return ts.isoformat()
-
-    # 排序确保时间顺序
-    enumerated_trades = list(enumerate(trades or []))
-
-    def _sort_key(item):
-        idx, trade = item
-        normalized = _normalize_trade_time(_ga(trade, 'time'))
-        return (normalized is None, normalized or '', idx)
-
-    enumerated_trades.sort(key=_sort_key)
-    sorted_trades = [trade for _, trade in enumerated_trades]
-    
-    # 按标的维护仓位均价
-    state: Dict[str, Dict[str, float]] = {}
-    def st(code: str):
-        if code not in state:
-            state[code] = {'qty': 0.0, 'avg': 0.0}
-        return state[code]
-
-    total_profit = 0.0  # 总盈利额
-    total_loss = 0.0    # 总亏损额（绝对值）
-    
-    for t in sorted_trades:
-        code = _ga(t, 'security')
-        if not code:
-            continue
-        s = st(code)
-        amt = float(_ga(t, 'amount', 0) or 0)
-        price = float(_ga(t, 'price', 0) or 0)
-        commission = float(_ga(t, 'commission', 0) or 0)
-        tax = float(_ga(t, 'tax', 0) or 0)
-        
-        if amt > 0:
-            # 买入：更新加权平均成本
-            total_cost = s['avg'] * s['qty'] + price * amt
-            s['qty'] = s['qty'] + amt
-            s['avg'] = (total_cost / s['qty']) if s['qty'] > 0 else 0.0
-        elif amt < 0:
-            # 卖出：计算盈亏
-            sell_qty = abs(amt)
-            # 盈亏 = (卖出价 - 成本价) * 数量 - 手续费 - 印花税
-            pnl = (price - s['avg']) * sell_qty - commission - tax
-            if pnl > 0:
-                total_profit += pnl
-            else:
-                total_loss += abs(pnl)
-            s['qty'] = max(0.0, s['qty'] - sell_qty)
-    
-    # 盈亏比 = 总盈利额 / 总亏损额
+    """以已平成交净盈亏计算总盈利额与总亏损额之比。"""
+    pnls = _closed_trade_pnls(trades)
+    total_profit = sum(pnl for pnl in pnls if pnl > 0)
+    total_loss = sum(abs(pnl) for pnl in pnls if pnl < 0)
     if total_loss > 1e-12:
         return total_profit / total_loss
-    elif total_profit > 1e-12:
-        return float('inf')  # 只盈利无亏损
-    else:
-        return 0.0
+    return float('inf') if total_profit > 1e-12 else 0.0
 
 
 def calculate_metrics(results: Dict[str, Any]) -> Dict[str, float]:
@@ -417,6 +569,7 @@ def calculate_metrics(results: Dict[str, Any]) -> Dict[str, float]:
             '策略年化收益': 0.0,
             '基准收益': 0.0,
             '基准年化收益': 0.0,
+            '累计超额收益': 0.0,
             'Alpha': 0.0,
             'Beta': 0.0,
             '夏普比率': 0.0,
@@ -433,13 +586,9 @@ def calculate_metrics(results: Dict[str, Any]) -> Dict[str, float]:
         }
     
     # 基本统计（与引擎摘要口径统一：以初始总资产为基准）
-    base = None
-    try:
-        base = float(results.get('meta', {}).get('initial_total_value'))
-    except Exception:
-        base = None
-    if not base or base <= 0:
-        base = float(df['total_value'].iloc[0])
+    base = _initial_equity_value(df, results.get('meta', {}).get('initial_total_value'))
+
+    benchmark_ctx = _compute_benchmark_context(df, base_value=base)
     
     # 策略收益（百分比）
     total_returns = (df['total_value'].iloc[-1] / base - 1) * 100
@@ -453,7 +602,9 @@ def calculate_metrics(results: Dict[str, Any]) -> Dict[str, float]:
         annual_returns = 0.0
     
     # 日收益率序列（小数形式）
-    daily_returns = df['daily_returns'].dropna()
+    daily_returns = df['total_value'].astype(float).pct_change()
+    daily_returns.iloc[0] = float(df['total_value'].iloc[0]) / base - 1.0
+    daily_returns = daily_returns.dropna()
     n = len(daily_returns)
     
     # 策略波动率（聚宽公式：sqrt(250/(n-1) * Σ(rp - rp_avg)^2)）
@@ -464,7 +615,7 @@ def calculate_metrics(results: Dict[str, Any]) -> Dict[str, float]:
         volatility = 0.0
     
     # 最大回撤（聚宽公式：Max((Px - Py) / Px)，y > x）
-    cummax = df['total_value'].expanding().max()
+    cummax = df['total_value'].expanding().max().clip(lower=base)
     drawdown = (df['total_value'] - cummax) / cummax * 100  # 百分比
     max_drawdown = float(drawdown.min())
     
@@ -480,7 +631,8 @@ def calculate_metrics(results: Dict[str, Any]) -> Dict[str, float]:
                 # 格式化日期字符串
                 peak_date = pd.to_datetime(dd_peak).date()
                 trough_date = pd.to_datetime(dd_trough).date()
-                max_dd_interval = f"{peak_date} 至 {trough_date}"
+                peak_label = "初始资金" if float(peak_series.max()) < base else str(peak_date)
+                max_dd_interval = f"{peak_label} 至 {trough_date}"
     except Exception:
         max_dd_interval = '计算失败'
     
@@ -568,6 +720,9 @@ def calculate_metrics(results: Dict[str, Any]) -> Dict[str, float]:
     metrics = {
         '策略收益': round(total_returns, 2),
         '策略年化收益': round(annual_returns, 2),
+        '基准收益': round(float(benchmark_ctx.get('benchmark_total_returns_pct') or 0.0), 2),
+        '基准年化收益': round(float(benchmark_ctx.get('benchmark_annual_returns_pct') or 0.0), 2),
+        '累计超额收益': round(float(benchmark_ctx.get('excess_total_returns_pct') or 0.0), 2),
         '策略波动率': round(volatility, 2),
         '最大回撤': round(max_drawdown, 2),
         '最大回撤区间': max_dd_interval,
@@ -607,19 +762,19 @@ def print_metrics(metrics: Dict[str, float]):
     for key, value in metrics.items():
         if '收益' in key or '波动' in key or '回撤' in key or '率' in key:
             if isinstance(value, (int, float)):
-                print(f"{key:20s}: {value:>12.2f}%")
+                print(f"{key}:".ljust(10) + f"\t{value:>12.2f}%")
             else:
-                print(f"{key:20s}: {value:>12}")
+                print(f"{key}:".ljust(10) + f"\t{value:>12}")
         elif '比率' in key or '比' in key:
             if isinstance(value, (int, float)):
-                print(f"{key:20s}: {value:>12.2f}")
+                print(f"{key}:".ljust(10) + f"\t{value:>12.2f}")
             else:
-                print(f"{key:20s}: {value:>12}")
+                print(f"{key}:".ljust(10) + f"\t{value:>12}")
         else:
             if isinstance(value, (int, float)):
-                print(f"{key:20s}: {value:>12.0f}")
+                print(f"{key}:".ljust(10) + f"\t{value:>12.0f}")
             else:
-                print(f"{key:20s}: {value:>12}")
+                print(f"{key}:".ljust(10) + f"\t{value:>12}")
     
     print("=" * 70)
 
@@ -693,9 +848,17 @@ def export_trades(results: Dict[str, Any], file_path: str):
         print("无交易记录")
         return
     
+    from .futures_account import is_futures_security
+
     # 转换为DataFrame
     trade_records = []
     for trade in trades:
+        metadata = {key: _get_trade_attr(trade, key) for key in ('action', 'side', 'multiplier')}
+        if all(value is None or (isinstance(value, float) and math.isnan(value)) for value in metadata.values()):
+            metadata = dict.fromkeys(metadata)
+        explicit_futures = is_futures_security(_get_trade_attr(trade, 'security')) and any(
+            value is not None for value in metadata.values()
+        )
         amount_val = _get_trade_attr(trade, 'amount', 0) or 0
         price_val = _get_trade_attr(trade, 'price', 0) or 0
         turnover_val = _get_trade_attr(trade, 'turnover')
@@ -703,18 +866,22 @@ def export_trades(results: Dict[str, Any], file_path: str):
             turnover_val = trade.get('金额')
         if turnover_val is None:
             turnover_val = price_val * abs(amount_val)
+            if explicit_futures:
+                turnover_val *= _trade_multiplier(_get_trade_attr(trade, 'security'), metadata['multiplier'])
         commission_val = _get_trade_attr(trade, 'commission', 0) or 0
         tax_val = _get_trade_attr(trade, 'tax', 0) or 0
         cost_val = _get_trade_attr(trade, 'cost')
         if cost_val is None:
             cost_val = commission_val + tax_val
+        raw_costs = dict(commission=commission_val, tax=tax_val, cost=cost_val)
         # 金额字段规范到“分”，四舍五入
         def _fen(x):
             from decimal import Decimal, ROUND_HALF_UP
             return float(Decimal(str(x)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
-        commission_val = _fen(commission_val)
-        tax_val = _fen(tax_val)
-        cost_val = _fen(cost_val)
+        if not explicit_futures:
+            commission_val = _fen(commission_val)
+            tax_val = _fen(tax_val)
+            cost_val = _fen(cost_val)
         direction_val = _get_trade_attr(trade, 'direction')
         if direction_val is None:
             if amount_val > 0:
@@ -723,7 +890,7 @@ def export_trades(results: Dict[str, Any], file_path: str):
                 direction_val = '卖出'
             else:
                 direction_val = '持仓'
-        trade_records.append({
+        record = {
             '时间': _get_trade_attr(trade, 'time'),
             '标的': _get_trade_attr(trade, 'security'),
             '数量': amount_val,
@@ -733,7 +900,18 @@ def export_trades(results: Dict[str, Any], file_path: str):
             '印花税': tax_val,
             '总费用': cost_val,
             '方向': direction_val,
-        })
+        }
+        # 原始数值供复算使用，保留既有中文展示列的精度。
+        record.update(raw_costs)
+        if explicit_futures:
+            record.update(metadata)
+        elif isinstance(_get_trade_attr(trade, 'pnl_basis_status'), str):
+            for key in (
+                'realized_pnl_gross', 'realized_pnl_net', 'allocated_entry_fees',
+                'allocated_distributions', 'pnl_basis_status',
+            ):
+                record[key] = _get_trade_attr(trade, key)
+        trade_records.append(record)
     
     df = pd.DataFrame(trade_records)
     df.to_csv(file_path, index=False, encoding='utf-8-sig')
@@ -828,6 +1006,16 @@ def load_results_from_directory(results_dir: str) -> Dict[str, Any]:
         'runtime_seconds': None,
     }
 
+    metrics_path = os.path.join(results_dir, 'metrics.json')
+    if os.path.exists(metrics_path):
+        try:
+            with open(metrics_path, 'r', encoding='utf-8') as fp:
+                payload = json.load(fp)
+            if isinstance(payload, dict):
+                results['meta'] = _merge_meta_dict(results['meta'], payload.get('meta', {}))
+        except Exception:
+            pass
+
     return results
 
 def generate_report(
@@ -877,8 +1065,7 @@ def generate_report(
                     results['events'] = loaded.get('events', [])
                 if results.get('daily_positions') is None:
                     results['daily_positions'] = loaded.get('daily_positions', None)
-                if not results.get('meta'):
-                    results['meta'] = loaded.get('meta', {})
+                results['meta'] = _merge_meta_dict(results.get('meta', {}), loaded.get('meta', {}))
             except Exception:
                 pass
             output_dir = output_dir or results_dir
@@ -1437,8 +1624,7 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
                     results['events'] = loaded.get('events', [])
                 if results.get('daily_positions') is None:
                     results['daily_positions'] = loaded.get('daily_positions', None)
-                if not results.get('meta'):
-                    results['meta'] = loaded.get('meta', {})
+                results['meta'] = _merge_meta_dict(results.get('meta', {}), loaded.get('meta', {}))
             except Exception:
                 pass
         if output_file is None and results_dir is not None:
@@ -1452,18 +1638,26 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
     events = results.get('events', [])
     metrics = calculate_metrics(results)
     meta = results.get('meta', {})
+    base_total_value = _initial_equity_value(df, meta.get('initial_total_value'))
+    benchmark_ctx = _compute_benchmark_context(df, base_value=base_total_value)
 
     # 页面标题与运行耗时
     title = meta.get('strategy_file', '策略回测报告')
     date_range = f"{meta.get('start_date', '')} 至 {meta.get('end_date', '')}"
     runtime_seconds = meta.get('runtime_seconds', None)
     runtime_text = f"总用时: {runtime_seconds:.2f}s" if isinstance(runtime_seconds, (int, float)) else "总用时: 未记录"
+    run_started_at = meta.get('run_started_at') or '未记录'
+    run_finished_at = meta.get('run_finished_at') or '未记录'
+    benchmark_code = meta.get('benchmark') or '-'
     
     # 样式（增加网格化风险指标布局与头部元信息 & 表格美化）
     style = """
     <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
-    .header { display: flex; justify-content: space-between; align-items: baseline; }
+    body { font-family: "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif; margin: 20px; color: #111827; }
+    .header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+    .brand { display: flex; align-items: center; gap: 14px; }
+    .brand-logo { width: 40px; height: 40px; flex: 0 0 40px; }
+    .eyebrow { font-size: 13px; font-weight: 700; color: #2563eb; letter-spacing: 0.08em; text-transform: uppercase; }
     .title { font-size: 24px; font-weight: bold; }
     .subtitle { color: #555; margin-top: 4px; }
     .meta { color: #333; font-size: 13px; }
@@ -1499,13 +1693,18 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
     """
     
     # 顶部头部
+    meta_lines = [f"Benchmark: {benchmark_code}", f"回测启动: {run_started_at}", f"回测结束: {run_finished_at}", runtime_text]
     header_html = f"""
     <div class=\"header\">
-      <div>
+      <div class=\"brand\">
+        <img class=\"brand-logo\" src=\"https://bullettrade.cn/favicon.svg\" alt=\"BulletTrade\" />
+        <div>
+        <div class=\"eyebrow\">BulletTrade 回测</div>
         <div class=\"title\">{title}</div>
         <div class=\"subtitle\">{date_range}</div>
+        </div>
       </div>
-      <div class=\"meta\">{runtime_text}</div>
+      <div class=\"meta\">{'<br>'.join(meta_lines)}</div>
     </div>
     """
     
@@ -1521,9 +1720,35 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
         ),
         secondary_y=False
     )
-    # 初始资金（用首日总资产作为近似）
+    benchmark_value = benchmark_ctx.get('benchmark_value')
+    if benchmark_value is not None:
+        fig_total.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=benchmark_value,
+                mode='lines',
+                name=f"Benchmark({benchmark_code})",
+                line=dict(color='#ff7f0e', width=2, dash='dot')
+            ),
+            secondary_y=False
+        )
+        excess_asset_value = pd.to_numeric(df['total_value'], errors='coerce') - pd.to_numeric(
+            benchmark_value,
+            errors='coerce',
+        )
+        fig_total.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=excess_asset_value,
+                mode='lines',
+                name='超额资产 (元)',
+                line=dict(color='#9467bd', width=2, dash='dot')
+            ),
+            secondary_y=False
+        )
+    # 初始资金与收益、回撤指标采用相同基准。
     if len(df) > 0:
-        init_cash = float(df['total_value'].iloc[0])
+        init_cash = base_total_value
         fig_total.add_trace(
             go.Scatter(
                 x=df.index,
@@ -1536,7 +1761,7 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
             secondary_y=False
         )
     # 回撤（右轴）
-    cummax = df['total_value'].expanding().max()
+    cummax = df['total_value'].expanding().max().clip(lower=base_total_value)
     drawdown = (df['total_value'] - cummax) / cummax * 100
     dd_min = float(drawdown.min()) if len(drawdown) > 0 else -1.0
     fig_total.add_trace(
@@ -1551,13 +1776,19 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
         secondary_y=True
     )
     fig_total.update_layout(title='总资产与回撤', xaxis_title='日期')
-    fig_total.update_yaxes(title_text='资产', secondary_y=False)
-    fig_total.update_yaxes(title_text='回撤 (%)', secondary_y=True, range=[min(dd_min * 1.05, -1.0), 0])
+    fig_total.update_yaxes(title_text='资产 / 超额资产 (元)', secondary_y=False)
+    fig_total.update_yaxes(
+        title_text='回撤 (%)',
+        secondary_y=True,
+        range=[min(dd_min * 1.05, -1.0), 0],
+        tickfont=dict(color='darkred'),
+        title_font=dict(color='darkred'),
+    )
     
     # 标注Top5最大回撤区间（峰到谷）
     intervals = []
-    peak_idx = 0
-    peak_val = float(df['total_value'].iloc[0]) if len(df) > 0 else 0.0
+    peak_idx = None
+    peak_val = base_total_value
     min_dd = 0.0
     min_idx = 0
     for i, v in enumerate(df['total_value'].values):
@@ -1579,18 +1810,19 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
     intervals.sort(key=lambda x: x[2])
     intervals = intervals[:5]
     for (p_idx, t_idx, ddv) in intervals:
-        start = df.index[p_idx]
+        start = df.index[p_idx] if p_idx is not None else df.index[0]
         end = df.index[t_idx]
         # 阴影高亮区间
         fig_total.add_vrect(x0=start, x1=end, fillcolor='rgba(214,39,40,0.3)', line_width=0, layer='below')
         # 在右轴（回撤轴）标注百分比与区间日期
         dd_val_pct = ddv * 100.0
         y = float(drawdown.iloc[t_idx]) if len(drawdown) > t_idx else 0
+        start_label = str(start.date()) if p_idx is not None else "初始资金"
         fig_total.add_annotation(
             x=end,
             y=y,
             yref='y2',
-            text=f"{abs(dd_val_pct):.2f}%<br>{start.date()} → {end.date()}",
+            text=f"{abs(dd_val_pct):.2f}%<br>{start_label} → {end.date()}",
             showarrow=True,
             arrowhead=2,
             ax=0,
@@ -1599,7 +1831,7 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
         )
     
     # 图2：年收益柱状图，添加数值标注
-    annual_returns = df['daily_returns'].resample('Y').sum() * 100
+    annual_returns = df['daily_returns'].resample(_YEAR_END_FREQ).sum() * 100
     annual_years = [d.year for d in annual_returns.index]
     annual_values = annual_returns.values
     fig_annual = go.Figure()
@@ -1615,7 +1847,7 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
     fig_annual.update_layout(title='年收益', xaxis_title='年份', yaxis_title='收益(%)', uniformtext_minsize=8, uniformtext_mode='hide')
     
     # 图3：月度热力图，添加每格标注（正红负绿）
-    monthly_returns = df['daily_returns'].resample('M').sum() * 100
+    monthly_returns = df['daily_returns'].resample(_MONTH_END_FREQ).sum() * 100
     heatmap_data = pd.DataFrame({ 'month': monthly_returns.index.month, 'year': monthly_returns.index.year, 'value': monthly_returns.values })
     pivot = heatmap_data.pivot(index='year', columns='month', values='value').fillna(0)
     monthly_colorscale = [[0.0, '#2ca02c'], [0.5, '#ffffbf'], [1.0, '#d62728']]
@@ -1628,6 +1860,7 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
         colorbar=dict(title='收益(%)')
     ))
     fig_monthly.update_layout(title='月度收益热力图', xaxis_title='月份', yaxis_title='年份')
+    fig_monthly.update_yaxes(autorange='reversed')
     # 添加每格文字标注
     for yi, yv in enumerate(pivot.index):
         for xi, xv in enumerate(pivot.columns):
@@ -1778,7 +2011,7 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
     # 风险指标网格（紧凑布局）
     metrics_items = list(metrics.items())
     # 格式化部分指标（带百分号）
-    percent_keys = {'策略收益','策略年化收益','最大回撤','日胜率','交易胜率','胜率'}
+    percent_keys = {'策略收益','策略年化收益','基准收益','基准年化收益','累计超额收益','最大回撤','日胜率','交易胜率','胜率'}
     metrics_html_items = []
     for k, v in metrics_items:
         val = v
@@ -1861,7 +2094,7 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
 
     # annual_returns
     try:
-        annual_df = df['daily_returns'].resample('Y').sum().to_frame('annual_returns')
+        annual_df = df['daily_returns'].resample(_YEAR_END_FREQ).sum().to_frame('annual_returns')
         annual_df = annual_df.reset_index()
         annual_df.rename(columns={annual_df.columns[0]: 'year'}, inplace=True)
         annual_df['annual_returns'] = annual_df['annual_returns'] * 100.0
@@ -2042,7 +2275,7 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
 <meta charset=\"utf-8\">
 <meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\">
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-<title>{title}</title>
+<title>BulletTrade 回测 - {title}</title>
 {style}
 </head>
 <body>
@@ -2398,6 +2631,7 @@ def build_daily_return_calendar_page_from_df(
     try:
         from pyecharts.charts import Calendar, Page
         from pyecharts import options as opts
+        from pyecharts.commons.utils import JsCode
     except Exception as e:
         raise RuntimeError(f"pyecharts 未安装或导入失败：{e}")
 
@@ -2417,7 +2651,7 @@ def build_daily_return_calendar_page_from_df(
     for y in years:
         data_year = [{
             "name": f"{d.strftime('%Y-%m-%d')}：{float(r_pct.loc[d]):.2f}%",
-            "value": [d.strftime("%Y-%m-%d"), float(c_val.loc[d])]
+            "value": [d.strftime("%Y-%m-%d"), float(c_val.loc[d]), float(r_pct.loc[d])]
         } for d in r_pct.index if d.year == y]
 
         if hatch_holiday:
@@ -2437,7 +2671,7 @@ def build_daily_return_calendar_page_from_df(
                 ds = d.strftime("%Y-%m-%d")
                 data_year.append({
                     "name": f"{ds}：{holiday_label}",
-                    "value": [ds, 0.0],
+                    "value": [ds, 0.0, None],
                     "itemStyle": {
                         "color": holiday_color,
                         "decal": decal_obj
@@ -2449,6 +2683,24 @@ def build_daily_return_calendar_page_from_df(
             .add(
                 series_name=str(y),
                 yaxis_data=data_year,
+                label_opts=opts.LabelOpts(
+                    is_show=True,
+                    position="inside",
+                    font_size=7,
+                    color="#333333",
+                    margin=0,
+                    formatter=JsCode(
+                        """
+                        function(params) {
+                          var raw = params.value && params.value.length > 2 ? params.value[2] : null;
+                          if (raw === null || raw === undefined || isNaN(raw)) {
+                            return '';
+                          }
+                          return raw.toFixed(1) + '%';
+                        }
+                        """
+                    ),
+                ),
                 calendar_opts=opts.CalendarOpts(
                     range_=str(y),
                     pos_top=inner_top_px,
@@ -2469,7 +2721,19 @@ def build_daily_return_calendar_page_from_df(
                     pos_left="center",
                     pos_top="2%"
                 ),
-                tooltip_opts=opts.TooltipOpts(formatter="{b}"),
+                tooltip_opts=opts.TooltipOpts(
+                    formatter=JsCode(
+                        """
+                        function(params) {
+                          var raw = params.value && params.value.length > 2 ? params.value[2] : null;
+                          if (raw === null || raw === undefined || isNaN(raw)) {
+                            return params.name;
+                          }
+                          return params.value[0] + '：' + raw.toFixed(2) + '%';
+                        }
+                        """
+                    )
+                ),
             )
         )
         page.add(cal)

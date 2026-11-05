@@ -1,65 +1,99 @@
 # 交易支撑：聚宽模拟盘远程实盘
 
-聚焦聚宽 Research/模拟盘如何调用远程 QMT server 完成真实下单，含截图与常见问题。
+这页只保留最小流程：聚宽策略如何连到远程 `bullet-trade server` 做真实下单。
 
-## 步骤总览
-1) 启动远程 QMT server（数据 + 交易）并放行防火墙。  
-2) 上传 helper 到聚宽根目录。  
-3) 在策略里配置 host/port/token，调用 helper 下单/查询。
+新用户请先按[聚宽从零接入教程](beginner-route-b.md)完成环境准备和两种方案的选择。下文显式 `bt.xxx` 简写不自动识别回测；兼顾回测时必须按教程分流，不能直接用于回测交易点。
 
-## 1. 启动 QMT server
-```bash
-bullet-trade server --listen 0.0.0.0 --port 58620 --token secret ^
-  --enable-data --enable-broker ^
-  --accounts main=123456:stock ^
-  --data-path "C:\国金QMT交易端\userdata_mini"
+聚宽侧改策略有两种策略修改方案：
+
+- [策略修改方案 1：显式调用 helper](joinquant-helper-explicit.md)：下单处写 `bt.order(...)`、`bt.order_target_value(...)`。
+- [策略修改方案 2：接管聚宽函数](joinquant-live-takeover-usage.md)：在 `process_initialize` 安装兼容层，原来的 `order(...)`、`context.portfolio` 尽量不改。
+
+两种方案的优缺点见 [聚宽策略修改方案对比](joinquant-integration-options.md)。
+
+## 1. 先启动远程 server
+
+下面是 MiniQMT 后端的启动方式。若 Windows 侧使用大 QMT，请先按 [大 QMT 服务向导](big-qmt-server.md) 在大 QMT 里运行 helper，再启动 `bullet-trade server --server-type big_qmt`；聚宽侧 helper 仍然连接 `58620`。
+
+Windows 机器上的 `.env` 最少只要：
+
+```env
+QMT_DATA_PATH=C:\国金QMT交易端\userdata_mini
+QMT_ACCOUNT_ID=123456
+QMT_SERVER_TOKEN=secret
 ```
-防火墙放行提示：
-![server-firewall](assets/server-firewall.png)
 
-服务端日志示例：
-![joinquant-server-qmt](assets/joinquant-server-qmt.png)
+启动命令：
 
-## 2. 聚宽 Research 上传 helper
-- 位置：聚宽根目录 `/`
-- 文件：`helpers/bullet_trade_jq_remote_helper.py`
-- 操作截图：
-![joinquant-sever-reserch](assets/joinquant-sever-reserch.png)
+```bash
+bullet-trade --env-file .env server --listen 0.0.0.0 --port 58620 --enable-data --enable-broker
+```
 
-## 3. 在策略里调用
+如果是单账户，到这里就够了。
+
+## 2. 上传 helper 到聚宽
+
+上传这个文件到聚宽根目录：
+
+- `helpers/bullet_trade_jq_remote_helper.py`
+
+## 3. 在策略里最小配置（显式 helper 调用）
+
 ```python
 import bullet_trade_jq_remote_helper as bt
-
-bt.configure(
-    host="your.server.ip",
-    port=58620,
-    token="secret",
-    account_key="main",    # 对应 --accounts 别名
-    sub_account_id=None,   # 可选
-)
-bt.bind_clients_to_globals()  # 将数据/券商客户端挂到 g
 
 def initialize(context):
     set_benchmark('000300.XSHG')
 
+def process_initialize(context):
+    bt.configure(
+        host="your.server.ip",
+        port=58620,
+        token="secret",
+    )
+
 def handle_data(context, data):
-    bt.order('000001.XSHE', 100)          # 买入
-    bt.order_value('000002.XSHE', 50000)  # 按金额买入
-    positions = bt.get_positions()
+    bt.order('000001.XSHE', 100)
 ```
-支持接口：`order/order_value/order_target/order_target_value`、`cancel_order/get_order_status/get_open_orders/get_orders/get_trades`、`get_account/get_positions`。
 
-### 运行效果
-聚宽策略日志+持仓：
-![joinquant-remote-live-support](assets/joinquant-remote-live-support.png)
+单账户默认不用写 `account_key`。  
+只有多账户时才写，例如：
 
-同步/异步下单时间线（默认同步等待 16s，示例 0.5s 成交）：
-![sync-order](assets/sync-order.png)
+```python
+bt.configure(
+    host="your.server.ip",
+    port=58620,
+    token="secret",
+    account_key="main",
+)
+```
 
 ## 常见问题
-- 401 未授权：token 不一致或被 `--allowlist` 限制。
-- 超时/未成交：查看服务端日志，按需调整 `wait_timeout` 或改用异步；确认行情正常。
-- 无行情：服务端需启用 `--enable-data` 且 QMT 已登录。
-- 多账户：server `--accounts a=...`，策略里 `account_key='a'` 指定。
 
-更多 server 侧参数与安全提示见 [QMT server](qmt-server.md)；配置变量详见 [配置总览](config.md)。
+### `account_key` 必须写吗
+
+不是。  
+单账户场景不用写；只有多账户才需要。
+
+### server 端为什么不能写 `--data-path`
+
+因为当前版本没有这个参数。  
+MiniQMT 数据目录要放到 `.env` 里的 `QMT_DATA_PATH`。大 QMT 不使用这个配置入口。
+
+### `:stock` 必须写吗
+
+也不是。  
+股票账户默认就是 `stock`，所以多账户示例写成：
+
+```bash
+--accounts main=123456
+```
+
+就可以。  
+只有期货账户才需要写成：
+
+```bash
+--accounts hedge=654321:future
+```
+
+更多 MiniQMT server 说明见 [QMT server](qmt-server.md)。大 QMT 后端见 [大 QMT 服务向导](big-qmt-server.md)。

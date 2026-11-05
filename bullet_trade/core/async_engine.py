@@ -16,7 +16,7 @@ from datetime import datetime, date, time as Time
 import pandas as pd
 import time as python_time
 
-from .engine import BacktestEngine, PRE_MARKET_OFFSET
+from .engine import BacktestEngine, PRE_MARKET_OFFSET, _is_tick_frequency
 from .event_loop import EventLoop
 from .event_bus import EventBus, EventPriority
 from .async_scheduler import AsyncScheduler, OverlapStrategy
@@ -115,6 +115,7 @@ class AsyncBacktestEngine(BacktestEngine):
         tasks = get_tasks()
         if not tasks:
             return
+        self._warn_every_bar_minute_semantics(tasks)
         
         log.info(f"迁移 {len(tasks)} 个调度任务到异步调度器")
         
@@ -185,6 +186,11 @@ class AsyncBacktestEngine(BacktestEngine):
             self.initial_cash = capital_base
         if frequency:
             self.frequency = frequency
+        if _is_tick_frequency(self.frequency):
+            # 异步日循环未接入 tick 合并事件流，跑下去会静默漏掉逐笔事件
+            raise NotImplementedError(
+                "异步回测不支持 tick 频率，请使用同步回测入口（use_async=False）运行 tick 回放"
+            )
         
         # 设置事件框架
         self._setup_event_framework()
@@ -390,18 +396,15 @@ class AsyncBacktestEngine(BacktestEngine):
     def _is_bar_time(self, current_dt: datetime, market_periods: Sequence[Tuple[Time, Time]], open_dt: datetime) -> bool:
         """
         判断当前时间是否应视为一个 bar 触发点：
-        - 分钟频率：交易时段内的每个整分
-        - 其他频率：仅在开盘触发
+        - 回测和实盘保持一致，交易时段内的每个整分都是 bar
         """
-        if str(getattr(self, "frequency", "day")).lower() == "minute":
-            if current_dt.second != 0:
-                return False
-            current_time = current_dt.time()
-            for start, end in market_periods:
-                if start <= current_time < end:
-                    return True
+        if current_dt.second != 0:
             return False
-        return current_dt == open_dt
+        current_time = current_dt.time()
+        for start, end in market_periods:
+            if start <= current_time < end:
+                return True
+        return False
     
     async def _process_trading_day(self, trade_day: datetime, day_index: int, total_days: int):
         """

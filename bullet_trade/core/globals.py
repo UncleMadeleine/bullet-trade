@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 from logging.handlers import RotatingFileHandler
+from string import Formatter
 from typing import Any, Optional
 from datetime import datetime
 
@@ -67,12 +68,28 @@ class _ColorFormatter(logging.Formatter):
     }
     RESET = "\033[0m"
 
-    def __init__(self, fmt: str, datefmt: Optional[str], color_enabled: bool) -> None:
+    def __init__(
+        self,
+        fmt: str,
+        datefmt: Optional[str],
+        color_enabled: bool,
+        compact_fmt: Optional[str] = None,
+    ) -> None:
         super().__init__(fmt=fmt, datefmt=datefmt)
+        self.full_fmt = fmt
+        self.compact_fmt = compact_fmt or fmt
         self.color_enabled = color_enabled
 
     def format(self, record: logging.LogRecord) -> str:
-        msg = super().format(record)
+        original_fmt = self._style._fmt
+        try:
+            if getattr(record, "hide_wall_time", False):
+                self._style._fmt = self.compact_fmt
+            else:
+                self._style._fmt = self.full_fmt
+            msg = super().format(record)
+        finally:
+            self._style._fmt = original_fmt
         if not self.color_enabled:
             return msg
         prefix = self.COLORS.get(record.levelno, "")
@@ -94,7 +111,12 @@ class Logger:
         self.strategy_time = None  # 策略时间（回测时间）
         self._file_handler: Optional[RotatingFileHandler] = None
         # 统一格式
-        self._formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        self._formatter = _ColorFormatter(
+            '%(asctime)s [%(levelname)s] %(message)s',
+            '%Y-%m-%d %H:%M:%S',
+            False,
+            compact_fmt='[%(levelname)s] %(message)s',
+        )
         self._color_enabled = self._detect_color_support()
 
         if not self.logger.handlers:
@@ -119,7 +141,14 @@ class Logger:
             # 控制台 handler
             sh = logging.StreamHandler()
             sh.setLevel(console_level)
-            sh.setFormatter(_ColorFormatter('%(asctime)s [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S', self._color_enabled))
+            sh.setFormatter(
+                _ColorFormatter(
+                    '%(asctime)s [%(levelname)s] %(message)s',
+                    '%Y-%m-%d %H:%M:%S',
+                    self._color_enabled,
+                    compact_fmt='[%(levelname)s] %(message)s',
+                )
+            )
             self.logger.addHandler(sh)
 
             # 文件 handler（按 .env 配置）
@@ -306,34 +335,76 @@ class Logger:
                     f"[{CURRENT_LABEL}:{current_str}] "
                     f"[delay={delay:+.3f}s] {msg}"
                 )
-            return f"[{STRATEGY_TIME_LABEL}:{strategy_str}] {msg}"
+            return f"[{strategy_str}] {msg}"
         except Exception:
             return msg
+
+    def _with_log_extra(self, kwargs: dict) -> dict:
+        extra = kwargs.get("extra")
+        if extra is None:
+            extra = {}
+        else:
+            extra = dict(extra)
+        try:
+            from .globals import g as _g  # type: ignore
+            if self.strategy_time and not bool(getattr(_g, 'live_trade', False)):
+                extra.setdefault("hide_wall_time", True)
+        except Exception:
+            pass
+        kwargs["extra"] = extra
+        return kwargs
+
+    def _emit(self, level: int, msg: Any, args: tuple, kwargs: dict):
+        """统一格式化参数，避免各输出处理器重复插值或丢失记录。"""
+        if not self.logger.isEnabledFor(level):
+            return
+        message = str(msg)
+        if args:
+            rendered = None
+            if "%" in message:
+                try:
+                    rendered = logging.LogRecord(
+                        self.logger.name, level, "", 0, message, args, None
+                    ).getMessage()
+                except (TypeError, ValueError, KeyError, OverflowError):
+                    pass
+            if rendered is None and "{" in message:
+                try:
+                    if any(field is not None for _, field, _, _ in Formatter().parse(message)):
+                        rendered = message.format(*args)
+                except (IndexError, KeyError, TypeError, ValueError, AttributeError):
+                    pass
+            if rendered is None:
+                rendered = " ".join([message] + [str(arg) for arg in args])
+            message = rendered
+        self.logger.log(
+            level, self._format_message(message), **self._with_log_extra(kwargs)
+        )
 
 
     def debug(self, msg: str, *args, **kwargs):
         """输出DEBUG级别日志"""
-        self.logger.debug(self._format_message(msg), *args, **kwargs)
+        self._emit(logging.DEBUG, msg, args, kwargs)
     
     def info(self, msg: str, *args, **kwargs):
         """输出INFO级别日志"""
-        self.logger.info(self._format_message(msg), *args, **kwargs)
+        self._emit(logging.INFO, msg, args, kwargs)
     
     def warn(self, msg: str, *args, **kwargs):
         """输出WARNING级别日志"""
-        self.logger.warning(self._format_message(msg), *args, **kwargs)
+        self._emit(logging.WARNING, msg, args, kwargs)
     
     def warning(self, msg: str, *args, **kwargs):
         """输出WARNING级别日志（别名）"""
-        self.logger.warning(self._format_message(msg), *args, **kwargs)
+        self._emit(logging.WARNING, msg, args, kwargs)
     
     def error(self, msg: str, *args, **kwargs):
         """输出ERROR级别日志"""
-        self.logger.error(self._format_message(msg), *args, **kwargs)
+        self._emit(logging.ERROR, msg, args, kwargs)
     
     def critical(self, msg: str, *args, **kwargs):
         """输出CRITICAL级别日志"""
-        self.logger.critical(self._format_message(msg), *args, **kwargs)
+        self._emit(logging.CRITICAL, msg, args, kwargs)
     
     def set_level(self, module: str, level: str):
         """

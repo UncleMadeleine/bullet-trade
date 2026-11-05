@@ -13,7 +13,9 @@ from .runtime import get_current_engine
 # 导入设置函数
 from .settings import (
     set_benchmark, set_order_cost, set_commission, set_universe, set_slippage, set_option,
-    OrderCost, PerTrade, FixedSlippage, PriceRelatedSlippage, StepRelatedSlippage
+    set_subportfolios, get_subportfolio_configs,
+    OrderCost, PerTrade, SubPortfolioConfig,
+    FixedSlippage, PriceRelatedSlippage, StepRelatedSlippage
 )
 
 # 导入订单函数
@@ -81,6 +83,60 @@ def _current_live_engine():
     return None
 
 
+def _current_backtest_engine():
+    """
+    如果当前处于回测引擎环境且支持 tick 回放订阅，则返回引擎实例。
+    """
+    try:
+        engine = get_current_engine()
+    except Exception:
+        return None
+    if engine is None or getattr(engine, 'is_live', False):
+        return None
+    if not callable(getattr(engine, 'register_backtest_tick_subscription', None)):
+        return None
+    return engine
+
+
+def require_data_capabilities(
+    required: Sequence[str] = (),
+    optional: Sequence[str] = (),
+    profile: Optional[str] = None,
+    schema_version: Optional[str] = None,
+) -> Any:
+    """在策略 ``initialize`` 内声明新增的必需和可选数据能力。
+
+    Args:
+        required: 缺失或未就绪时必须停止启动的 capability ID。
+        optional: 缺失时仅保留诊断的 capability ID。
+        profile: 可选 execution_only、realtime_microstructure_signal 或 research_live。
+        schema_version: 可选声明版本，必须与静态声明一致。
+
+    Returns:
+        Any: LiveEngine 合并后的不可变 ``StrategyCapabilityRequirements``。
+
+    Raises:
+        RuntimeError: 不在 LiveEngine ``initialize`` 阶段或引擎不支持时抛出。
+        ValueError: 画像或版本与静态声明冲突时抛出。
+
+    Side Effects:
+        只追加内存中的待预检清单，不读数据、不连网且不触发交易。
+    """
+
+    engine = _current_live_engine()
+    if engine is None:
+        raise RuntimeError("require_data_capabilities 只能在 LiveEngine initialize 中使用")
+    collector = getattr(engine, "require_data_capabilities", None)
+    if not callable(collector):
+        raise RuntimeError("当前 LiveEngine 不支持策略能力声明")
+    return collector(
+        required=required,
+        optional=optional,
+        profile=profile,
+        schema_version=schema_version,
+    )
+
+
 def subscribe(security: Union[str, Sequence[str]], frequency: str) -> None:
     """
     订阅标的的 tick 事件。
@@ -106,6 +162,14 @@ def subscribe(security: Union[str, Sequence[str]], frequency: str) -> None:
     engine = _current_live_engine()
     if engine:
         engine.register_tick_subscription(norm_syms, markets)
+        return
+
+    backtest_engine = _current_backtest_engine()
+    if backtest_engine is not None:
+        for symbol in norm_syms:
+            backtest_engine.register_backtest_tick_subscription(symbol)
+        if markets:
+            log.debug(f"tick 回测忽略市场级订阅代码: {sorted(markets)}")
         return
 
     provider = _remote_provider()
@@ -169,6 +233,12 @@ def unsubscribe(security: Union[str, Sequence[str]], frequency: str) -> None:
         engine.unregister_tick_subscription(norm_syms, markets)
         return
 
+    backtest_engine = _current_backtest_engine()
+    if backtest_engine is not None:
+        for symbol in norm_syms:
+            backtest_engine.unregister_backtest_tick_subscription(symbol)
+        return
+
     with _tick_lock:
         for s in norm_syms:
             _tick_subscribed.discard(str(s))
@@ -206,6 +276,11 @@ def unsubscribe_all() -> None:
         engine.unsubscribe_all_ticks()
         return
 
+    backtest_engine = _current_backtest_engine()
+    if backtest_engine is not None:
+        backtest_engine.clear_backtest_tick_subscriptions()
+        return
+
     with _tick_lock:
         _tick_subscribed.clear()
         _xt_markets.clear()
@@ -235,6 +310,10 @@ def get_current_tick(
     engine = _current_live_engine()
     if engine and hasattr(engine, "get_current_tick_snapshot"):
         return engine.get_current_tick_snapshot(security)  # type: ignore[no-any-return]
+    backtest_engine = _current_backtest_engine()
+    if backtest_engine is not None and backtest_engine.is_tick_backtest():
+        # tick 回放只读回放缓冲：无快照即返回 None，不用分钟线合成、不取实时行情
+        return backtest_engine.get_current_tick_snapshot(security)
     return _data_get_current_tick(security, dt=dt, df=df)
 
 
@@ -245,6 +324,26 @@ def set_tick_handler(handler: Callable[[Any, Dict[str, Any]], None]) -> None:
     """
     global _tick_handler
     _tick_handler = handler
+
+
+def _forward_remote_tick(context: Any, tick: Dict[str, Any]) -> None:
+    """把 qmt-remote 推送的标准 tick 原样转发给策略回调。
+
+    Args:
+        context: 远程数据源注册时绑定的最小策略上下文。
+        tick: 已由 ``RemoteQmtProvider`` 规范化的 tick 字典。
+
+    Returns:
+        None: 本函数只做同步回调转发，不产生返回值。
+
+    Side Effects:
+        已注册处理函数时会同步调用 ``handler(context, tick)``；未注册时静默返回。
+    """
+
+    handler = _tick_handler
+    if handler is None:
+        return
+    handler(context, tick)
 
 
 def _to_qmt_code(code: str) -> str:
@@ -420,19 +519,54 @@ def get_orders(
     security: Optional[str] = None,
     status: Optional[object] = None,
     from_broker: bool = False,
+    strict: bool = False,
 ) -> Dict[str, Order]:
-    """
-    查询当日订单快照（聚宽风格）。
+    """查询当日订单快照（聚宽风格）。
+
+    Args:
+        order_id: 可选订单号。
+        security: 可选证券代码。
+        status: 可选订单状态。
+        from_broker: 是否要求柜台原始范围。
+        strict: 为 True 时传播查询异常，适合下单后的资金安全收口。
+
+    Returns:
+        Dict[str, Order]: 订单号到订单快照的映射。
+
+    Raises:
+        Exception: strict=True 时传播 Engine 或券商查询异常。
     """
     engine = get_current_engine()
     if not engine:
         return {}
     getter = getattr(engine, "get_orders", None)
     if not callable(getter):
+        if strict:
+            raise RuntimeError("BROKER_ORDER_QUERY_UNAVAILABLE")
         return {}
     try:
-        return getter(order_id=order_id, security=security, status=status, from_broker=from_broker) or {}
+        return (
+            getter(
+                order_id=order_id,
+                security=security,
+                status=status,
+                from_broker=from_broker,
+                strict=strict,
+            )
+            or {}
+        )
+    except TypeError:
+        if strict:
+            raise
+        return getter(
+            order_id=order_id,
+            security=security,
+            status=status,
+            from_broker=from_broker,
+        ) or {}
     except Exception:
+        if strict:
+            raise
         return {}
 
 
@@ -454,6 +588,7 @@ def get_open_orders() -> Dict[str, Order]:
         return {}
     open_states = {
         OrderStatus.new.value,
+        "submitted",
         OrderStatus.open.value,
         OrderStatus.filling.value,
         OrderStatus.canceling.value,
@@ -468,19 +603,38 @@ def get_open_orders() -> Dict[str, Order]:
 def get_trades(
     order_id: Optional[str] = None,
     security: Optional[str] = None,
+    strict: bool = False,
 ) -> Dict[str, Trade]:
-    """
-    查询当日成交快照（聚宽风格）。
+    """查询当日成交快照（聚宽风格）。
+
+    Args:
+        order_id: 可选订单号。
+        security: 可选证券代码。
+        strict: 为 True 时传播查询异常，适合已提交订单的终态收口。
+
+    Returns:
+        Dict[str, Trade]: 成交号到成交快照的映射。
+
+    Raises:
+        Exception: strict=True 时传播 Engine 或券商查询异常。
     """
     engine = get_current_engine()
     if not engine:
         return {}
     getter = getattr(engine, "get_trades", None)
     if not callable(getter):
+        if strict:
+            raise RuntimeError("BROKER_TRADE_QUERY_UNAVAILABLE")
         return {}
     try:
+        return getter(order_id=order_id, security=security, strict=strict) or {}
+    except TypeError:
+        if strict:
+            raise
         return getter(order_id=order_id, security=security) or {}
     except Exception:
+        if strict:
+            raise
         return {}
 
 # 导出所有API
@@ -490,7 +644,9 @@ __all__ = [
     
     # 设置函数
     'set_benchmark', 'set_order_cost', 'set_commission', 'set_universe', 'set_slippage', 'set_option',
-    'OrderCost', 'PerTrade', 'FixedSlippage', 'PriceRelatedSlippage', 'StepRelatedSlippage',
+    'set_subportfolios', 'get_subportfolio_configs',
+    'OrderCost', 'PerTrade', 'SubPortfolioConfig',
+    'FixedSlippage', 'PriceRelatedSlippage', 'StepRelatedSlippage',
     
     # 订单函数
     'order', 'order_value', 'order_target', 'order_target_value', 'cancel_order', 'cancel_all_orders',
@@ -516,6 +672,8 @@ __all__ = [
     'get_split_dividend',
     'set_data_provider', 'get_data_provider',
     'read_file', 'write_file',
+    # Live 能力声明
+    'require_data_capabilities',
     # Tick 订阅占位
     'subscribe', 'unsubscribe', 'unsubscribe_all',
 ]

@@ -1,76 +1,53 @@
-# BulletTrade 帮助文档
+# BulletTrade 文档
 
-BulletTrade 是一套兼容聚宽 API 的量化研究与交易框架，支持多数据源、多券商接入，覆盖回测、仿真与本地/远程实盘。本页是文档主入口，与 bullettrade.cn 首页的“文档/帮助”按钮保持一致。
+BulletTrade 是一套兼容聚宽 API 的开源量化研究与交易框架。新用户不需要先读完整配置表：先选一种运行方式，只填写当前步骤真正需要的参数。
 
-<p>
-  <img src="assets/logo.png" alt="BulletTrade Logo" width="100">
-</p>
+## 第一次来，从这里开始
 
-## index
-- [快速上手](quickstart.md)：三步跑通回测/实盘，聚宽策略无改直接复用。
-- [研究环境（JupyterLab）](research.md)：`bullet-trade lab` 一键启动 Notebook，默认根目录、设置文件与示例说明。
-- [配置总览](config.md)：回测/本地实盘/远程实盘/聚宽接入的环境变量一览。
-- [回测引擎](backtest.md)：真实价格成交、分红送股处理、聚宽代码示例与 CLI 回测。
-- [参数优化](optimize.md)：多进程并行参数寻优，自动找出最优策略参数。
-- [实盘引擎](live.md)：本地 QMT 独立实盘与远程实盘流程。
-- [交易支撑](trade-support.md)：聚宽模拟盘接入、远程 QMT 服务与 helper 用法。
-- [QMT 服务配置](qmt-server.md)：bullet-trade server 的完整说明。
-- [Tick 订阅指南](tick.md)：本地 xtdata 与远程 qmt-remote 的订阅、字段与常见问题。
-- [数据源指南](data/DATA_PROVIDER_GUIDE.md)：聚宽、MiniQMT、Tushare 以及自定义 Provider 配置。
-- [API 文档](api.md)：策略可用 API、类模型与工具函数。
+1. [安装 Python 与 BulletTrade](python-setup.md)
+2. [新手选型](beginner-guide.md)
+3. [大 QMT：两种接入方式](big-qmt-server.md)
 
-**链接**：
-- GitHub 仓库 https://github.com/BulletTrade/bullet-trade 
-- 官方站点 https://bullettrade.cn/
+当前主要推荐大 QMT。MiniQMT 继续作为兼容方案保留；华鑫 TORA 面向自备 SDK 的专业用户，不作为新手主线。
 
-## 风险与声明
-- 量化及实盘有市场与系统风险，任何策略/软件均不保证收益,软件不可避免有BUG,请先小额或模拟验证，自行承担交易风险。
-- TuShare 数据源受测试账号权限限制，覆盖不完全，欢迎补充测试与提交 PR 完善。
-- 目前示例策略以量价数据为主，若需要财务/基本面等扩展，建议先在聚宽模拟环境调用，再通过 qmt server 完成下单。
+## 大 QMT 的两条主路线
 
+### 聚宽运行策略
 
-## 一键安装与环境准备
+策略继续在聚宽运行，通过互联网连接自己的 BulletTrade 服务，再由大 QMT 完成账户查询和下单。
 
-- 推荐使用 Python 3.10+ 并创建虚拟环境：
-  ```bash
-  python -m venv .venv
-  # macos/linux
-  source .venv/bin/activate
-  # windows
-  .venv\Scripts\activate.bat
-  ```
-- 一键安装：
-  ```bash
-  pip install bullet-trade
-  ```
-- 开发/贡献模式：
-  ```bash
-  pip install -e "bullet-trade[dev]"
-  cp bullet-trade/env.example bullet-trade/.env
-  ```
-- 安装后可用 `python -m bullet_trade.cli --help` 或 `bullet-trade --version` 检查。
+[已有聚宽策略：从零接入教程（两种改法）](beginner-route-b.md)
 
-## BulletTrade 有哪些优势
-- 兼容聚宽策略：`from jqdata import *` / `from bullet_trade.compat.api import *` 即可平滑迁移。
-- 数据自由切换：JQData、MiniQMT、TuShare、本地缓存、远程 QMT server 均可用。
-- 券商多入口：本地 QMT、远程 QMT server 与模拟券商可按场景切换。
-- CLI 简单双击：回测、报告生成、实盘/服务启动都用同一套命令。
+### 本地运行策略
 
-## 常用 CLI 速览
-- 回测：  
-  `bullet-trade backtest strategies/demo_strategy.py --start 2024-01-01 --end 2024-03-01 --frequency minute --benchmark 000300.XSHG`
-- 参数优化：  
-  `bullet-trade optimize strategies/demo_strategy.py --params params.json --start 2020-01-01 --end 2023-12-31 --output optimization.csv`
-- 实盘（本地/远程 QMT，未配置时可先用模拟券商）：  
-  `bullet-trade live strategies/demo_strategy.py --broker qmt`  
-  `bullet-trade live strategies/demo_strategy.py --broker qmt-remote  # 需要 .env 配好 QMT_SERVER_*`
-- 远程服务（MiniQMT+QMT）：  
-  `bullet-trade server --listen 0.0.0.0 --port 58620 --token secret --enable-data --enable-broker`
-- 报告：  
-  `bullet-trade report --input backtest_results --format html`
+策略由 `bullet-trade live` 在本地运行，通过 `qmt-remote` 连接同一台机器上的大 QMT。
 
-## 联系与支持
+[查看本地路线的完整步骤](big-qmt-server.md#local-route)
 
-如需交流或反馈，低佣开通QMT等，可扫码添加微信，并在 Issue/PR 中提出建议：
+## 按任务查文档
 
-<img src="assets/wechat-contact.png" alt="微信二维码" width="180">
+- [快速上手](quickstart.md)：先跑通最小示例。
+- [研究环境](research.md)：启动 JupyterLab。
+- [回测引擎](backtest.md)：运行和检查回测。
+- [实盘引擎](live.md)：了解本地实盘运行方式。
+- [配置总览](config.md)：只有需要扩展默认行为时再查。
+- [API 文档](api.md)：查策略函数和对象。
+- [数据源指南](data/DATA_PROVIDER_GUIDE.md)：选择 JQData、QMT、Tushare 等数据源。
+
+## 安装
+
+```bash
+pip install bullet-trade
+```
+
+安装后检查：
+
+```bash
+bullet-trade --version
+```
+
+开发者可参考 [邀请贡献](contributing.md)，问题和建议请提交到 [GitHub Issues](https://github.com/BulletTrade/bullet-trade/issues)。
+
+## 风险提示
+
+量化与实盘存在市场、网络和软件风险。策略与软件不保证收益；请先在仿真环境验证，再以小额资金逐步上线。服务启动、请求成功或返回订单号都不等于已经成交，最终应核对券商委托、成交和持仓。

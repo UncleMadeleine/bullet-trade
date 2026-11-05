@@ -1,7 +1,7 @@
 """
 every_bar 组合测试策略
 
-测试 every_bar 在分钟回测下的行为，包含：
+测试 every_bar 在回测下的行为，包含：
 1. run_daily(..., time='every_bar') 每分钟触发
 2. run_weekly 周二 10:00 触发
 3. run_monthly 月首 10:00 触发
@@ -157,4 +157,3 @@ def print_monthly_pnl(context):
     })
     
     log.info(f"月首收益: 时间={current_dt}, 总资产={total_value:.2f}, 收益率={returns*100:.2f}%")
-

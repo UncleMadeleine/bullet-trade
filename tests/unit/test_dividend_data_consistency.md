@@ -69,7 +69,7 @@
 
 2. **安装依赖**：
    ```bash
-   pip install -e bullet-trade[dev]
+   pip install -e ".[dev]"
    pip install jqdatasdk  # 如果测试 jqdata
    pip install xtquant    # 如果测试 miniqmt
    pip install tushare    # 如果测试 tushare
@@ -210,4 +210,3 @@ cash_in = (持仓数量 / per_base) × bonus_pre_tax
 - 测试文件：
   - `tests/unit/test_exec_and_dividends_reference.py` (回测集成测试)
   - `tests/unit/test_dividend_data_consistency.py` (本测试套件)
-
