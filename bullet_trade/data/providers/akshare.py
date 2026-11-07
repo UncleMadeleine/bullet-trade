@@ -1135,6 +1135,26 @@ class AkshareProvider(DataProvider):
                 return round(float(quantile.iloc[-1]) * 100, 1)
         return round(float((series <= pb).mean()) * 100, 1)
 
+    def _fetch_market_pb_series(self) -> pd.DataFrame:
+        """拉取全A中位数 PB 历史序列, 返回 date/middlePB 两列。"""
+        ak = self._ensure_akshare()
+        df = pd.DataFrame(ak.stock_a_all_pb())
+        if df.empty or "date" not in df.columns or "middlePB" not in df.columns:
+            raise ValueError("全A市净率历史序列缺少 date/middlePB 字段")
+        result = df[["date", "middlePB"]].copy()
+        result["date"] = pd.to_datetime(result["date"], errors="coerce")
+        result["middlePB"] = pd.to_numeric(result["middlePB"], errors="coerce")
+        return result.dropna(subset=["date", "middlePB"]).reset_index(drop=True)
+
+    def get_market_pb_series(self) -> pd.DataFrame:
+        """获取全A中位数 PB 历史序列, 返回 date/middlePB 两列。"""
+        return self._cache.cached_call(
+            "get_market_pb_series",
+            {},
+            lambda _: self._fetch_market_pb_series(),
+            result_type="df",
+        )
+
     def get_market_pb_percentile(self) -> float:
         """获取全市场 PB 历史分位 (0~100), 用于仓位管理。"""
         return self._cache.cached_call(
@@ -1145,17 +1165,24 @@ class AkshareProvider(DataProvider):
         )
 
     def _fetch_financial_snapshot(self, period: str) -> Dict[str, Dict[str, Any]]:
-        """按报告期拉取全市场业绩报表, 返回 {6位代码: {roe, revenue_growth, industry}}。"""
+        """按报告期拉取全市场业绩报表及策略所需每股指标。"""
         ak = self._ensure_akshare()
         df = pd.DataFrame(ak.stock_yjbb_em(date=period))
         if df.empty:
             return {}
         code_col = self._pick_column(df, "股票代码", "代码")
+        name_col = self._pick_column(df, "股票简称", "证券简称", "名称")
         roe_col = self._pick_column(df, "净资产收益率")
         growth_col = self._pick_column(df, "营业总收入-同比增长")
+        eps_col = self._pick_column(df, "每股收益")
+        bvps_col = self._pick_column(df, "每股净资产")
         industry_col = self._pick_column(df, "所处行业")
-        if code_col is None or roe_col is None or growth_col is None:
-            raise ValueError(f"业绩报表缺少 ROE/营收增速字段: {list(df.columns)}")
+        if any(
+            col is None for col in (code_col, roe_col, growth_col, eps_col, bvps_col)
+        ):
+            raise ValueError(
+                f"业绩报表缺少代码/ROE/营收增速/EPS/BVPS字段: {list(df.columns)}"
+            )
         snapshot: Dict[str, Dict[str, Any]] = {}
         for _, row in df.iterrows():
             code = self._to_ak_symbol(str(row.get(code_col) or "")).strip().zfill(6)
@@ -1165,8 +1192,15 @@ class AkshareProvider(DataProvider):
             if industry is not None and pd.isna(industry):
                 industry = None
             snapshot[code] = {
+                "name": (
+                    ""
+                    if name_col is None or pd.isna(row.get(name_col))
+                    else str(row.get(name_col))
+                ),
                 "roe": self._to_float(row.get(roe_col)),
                 "revenue_growth": self._to_float(row.get(growth_col)),
+                "eps": self._to_float(row.get(eps_col)),
+                "bvps": self._to_float(row.get(bvps_col)),
                 "industry": "" if industry is None else str(industry),
             }
         return snapshot
@@ -1176,7 +1210,8 @@ class AkshareProvider(DataProvider):
         codes: Optional[Union[str, Sequence[str]]] = None,
         date: Optional[str] = None,
     ) -> Dict[str, Dict[str, Any]]:
-        """获取全市场财务快照 (ROE/营收增速/行业); codes 非空时按代码过滤。
+        """获取全市场财务快照 (名称/ROE/营收增速/EPS/BVPS/行业)。
+        codes 非空时按代码过滤。
 
         date 指定报告期 (如 "20260930"); 默认按披露进度推断最新报告期,
         指定报告期无数据时逐级回退到更早的报告期。
@@ -1187,7 +1222,8 @@ class AkshareProvider(DataProvider):
         periods = [str(date)] if date else self._report_periods()
         for period in periods:
             snapshot = self._cache.cached_call(
-                "get_financial_snapshot",
+                # Version the cache key because this snapshot now includes EPS/BVPS/name.
+                "get_financial_snapshot_v2",
                 {"date": period},
                 lambda _: self._fetch_financial_snapshot(period),
                 result_type="list_dict",

@@ -260,6 +260,8 @@ class FakeAk:
                     "股票简称": "平安银行",
                     "净资产收益率": 8.07,
                     "营业总收入-同比增长": 2.42,
+                    "每股收益": 0.5,
+                    "每股净资产": 10.0,
                     "所处行业": industry,
                 },
                 {
@@ -267,6 +269,8 @@ class FakeAk:
                     "股票简称": "浦发银行",
                     "净资产收益率": 5.2,
                     "营业总收入-同比增长": 4.42,
+                    "每股收益": 0.3,
+                    "每股净资产": 12.0,
                     "所处行业": industry,
                 },
             ]
@@ -517,6 +521,22 @@ def test_akshare_market_pb_percentile_falls_back_to_series_rank() -> None:
 
 
 @pytest.mark.unit
+def test_akshare_market_pb_series_returns_normalized_columns() -> None:
+    """历史 PB 序列通过 provider 暴露为标准日期和数值列。"""
+    provider = _provider()
+
+    series = provider.get_market_pb_series()
+
+    assert list(series.columns) == ["date", "middlePB"]
+    assert series["date"].dt.strftime("%Y-%m-%d").tolist() == [
+        "2024-01-31",
+        "2024-02-29",
+        "2024-03-31",
+    ]
+    assert series["middlePB"].tolist() == [2.1, 2.3, 2.2]
+
+
+@pytest.mark.unit
 def test_akshare_financial_snapshot_filters_codes_and_normalizes() -> None:
     """财务快照应按代码过滤, 并输出 roe/revenue_growth/industry。"""
     provider = _provider()
@@ -526,6 +546,9 @@ def test_akshare_financial_snapshot_filters_codes_and_normalizes() -> None:
     assert set(snapshot) == {"000001", "600000"}
     assert snapshot["000001"]["roe"] == 8.07
     assert snapshot["000001"]["revenue_growth"] == 2.42
+    assert snapshot["000001"]["name"] == "平安银行"
+    assert snapshot["000001"]["eps"] == 0.5
+    assert snapshot["000001"]["bvps"] == 10.0
     assert snapshot["000001"]["industry"] == "银行Ⅱ"
 
 
