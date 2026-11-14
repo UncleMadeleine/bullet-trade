@@ -1,4 +1,5 @@
 import datetime as dt
+import logging
 
 import pandas as pd
 import pytest
@@ -160,6 +161,177 @@ class _DummyFinance:
         """
         _ = q
         return self._df
+
+
+class _RecordingQuery:
+    def __init__(self, *columns):
+        self.columns = columns
+        self.filters = []
+        self.order_field = None
+        self.limit_value = None
+
+    def filter(self, *args, **kwargs):
+        self.filters.extend(args)
+        return self
+
+    def order_by(self, field):
+        self.order_field = field
+        return self
+
+    def limit(self, value):
+        self.limit_value = value
+        return self
+
+
+class _RecordingFinance:
+    STK_AH_PRICE_COMP = jqdata._FINANCE_TABLE_STUB
+
+    def __init__(self):
+        self.queries = []
+
+    def run_query(self, statement):
+        self.queries.append(statement)
+        return pd.DataFrame(
+            [{"day": dt.date(2024, 1, 1), "h_a_comp": 1.0 + len(self.queries)}]
+        )
+
+
+class _RangeColumn:
+    """记录比较条件，便于假 finance 按日期区间返回不同行数。"""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __eq__(self, other):
+        return ("eq", self.name, other)
+
+    def __ge__(self, other):
+        return ("ge", self.name, other)
+
+    def __le__(self, other):
+        return ("le", self.name, other)
+
+
+class _RangeTable:
+    def __getattr__(self, name):
+        return _RangeColumn(name)
+
+
+class _RangeFinance:
+    STK_AH_PRICE_COMP = _RangeTable()
+
+    def __init__(self, rows_per_day):
+        self.rows_per_day = rows_per_day
+        self.queries = []
+
+    def run_query(self, statement):
+        self.queries.append(statement)
+        bounds = {item[0]: item[2] for item in statement.filters}
+        start = bounds["ge"]
+        end = bounds["le"]
+        days = (end - start).days + 1
+        rows = min(days * self.rows_per_day, statement.limit_value)
+        return pd.DataFrame({"day": [start] * rows})
+
+
+@pytest.mark.unit
+def test_get_finance_table_chunks_by_date(monkeypatch):
+    provider = JQDataProvider({"cache_dir": None})
+    fake_finance = _RecordingFinance()
+    monkeypatch.setattr(jqdata, "finance", fake_finance)
+    monkeypatch.setattr(jqdata, "query", lambda *columns, **kwargs: _RecordingQuery(*columns))
+
+    result = provider.get_finance_table(
+        "STK_AH_PRICE_COMP",
+        "2024-01-01",
+        "2024-01-25",
+        fields=["day", "a_code", "h_a_comp"],
+        chunk_days=10,
+    )
+
+    # 1/1-1/10, 1/11-1/20, 1/21-1/25 三段
+    assert len(result) == 3
+    assert len(fake_finance.queries) == 3
+    assert all(q.limit_value == 3000 for q in fake_finance.queries)
+    assert all(q.order_field is not None for q in fake_finance.queries)
+
+
+@pytest.mark.unit
+def test_get_finance_table_subdivides_when_hitting_limit(monkeypatch):
+    provider = JQDataProvider({"cache_dir": None})
+    fake_finance = _RangeFinance(rows_per_day=400)
+    monkeypatch.setattr(jqdata, "finance", fake_finance)
+    monkeypatch.setattr(jqdata, "query", lambda *columns, **kwargs: _RecordingQuery(*columns))
+
+    result = provider.get_finance_table(
+        "STK_AH_PRICE_COMP",
+        "2024-01-01",
+        "2024-01-25",
+        chunk_days=10,
+    )
+
+    # 10 天分段各 4000 行会触达 3000 上限，二分后 5 天分段不再截断
+    assert len(result) == 25 * 400
+    # 两个 10 天分段各 3 次查询（父段 + 两个子段），最后 5 天分段 1 次
+    assert len(fake_finance.queries) == 7
+
+
+@pytest.mark.unit
+def test_get_finance_table_warns_when_single_day_truncated(monkeypatch, caplog):
+    provider = JQDataProvider({"cache_dir": None})
+    fake_finance = _RangeFinance(rows_per_day=3000)
+    monkeypatch.setattr(jqdata, "finance", fake_finance)
+    monkeypatch.setattr(jqdata, "query", lambda *columns, **kwargs: _RecordingQuery(*columns))
+
+    with caplog.at_level(logging.WARNING):
+        result = provider.get_finance_table(
+            "STK_AH_PRICE_COMP",
+            "2024-01-01",
+            "2024-01-02",
+        )
+
+    assert len(result) == 2 * 3000
+    assert any("单日返回达到" in rec.getMessage() for rec in caplog.records)
+
+
+@pytest.mark.unit
+def test_get_finance_table_rejects_unknown_table(monkeypatch):
+    provider = JQDataProvider({"cache_dir": None})
+    monkeypatch.setattr(jqdata, "finance", object())
+    with pytest.raises(ValueError, match="没有表"):
+        provider.get_finance_table("NOT_A_REAL_TABLE", "2024-01-01", "2024-01-02")
+
+
+@pytest.mark.unit
+def test_get_ah_premium_uses_official_fields(monkeypatch):
+    provider = JQDataProvider({"cache_dir": None})
+    recorded = {}
+
+    def fake_get_finance_table(table_name, start_date=None, end_date=None, **kwargs):
+        recorded.update(
+            {
+                "table_name": table_name,
+                "start_date": start_date,
+                "end_date": end_date,
+                **kwargs,
+            }
+        )
+        return pd.DataFrame()
+
+    monkeypatch.setattr(provider, "get_finance_table", fake_get_finance_table)
+    provider.get_ah_premium("2024-01-01", "2024-01-31")
+
+    assert recorded["table_name"] == "STK_AH_PRICE_COMP"
+    assert recorded["start_date"] == "2024-01-01"
+    assert recorded["end_date"] == "2024-01-31"
+    assert recorded["fields"] == [
+        "day",
+        "a_code",
+        "h_code",
+        "a_price",
+        "h_price",
+        "h_a_comp",
+    ]
 
 
 @pytest.mark.unit

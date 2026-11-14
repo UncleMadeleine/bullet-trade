@@ -72,6 +72,59 @@ class DataProvider(ABC):
     ) -> List[Dict[str, Any]]:
         pass
 
+    def get_finance_table(
+        self,
+        table_name: str,
+        start_date: Optional[Union[str, datetime]] = None,
+        end_date: Optional[Union[str, datetime]] = None,
+        *,
+        date_field: str = "day",
+        fields: Optional[List[str]] = None,
+        filters: Optional[Dict[str, Any]] = None,
+        chunk_days: int = 10,
+        limit: int = 3000,
+    ) -> pd.DataFrame:
+        """查询数据源官方的 finance/市场通数据表（可选实现）。
+
+        聚宽 JQData 通过 ``finance.run_query`` 提供 AH 比价、港股通汇率、
+        沪深港通持股等表；其它 provider 可按自身能力实现，不支持时直接抛
+        ``NotImplementedError``。
+
+        Args:
+            table_name: 官方表名，例如 ``STK_AH_PRICE_COMP``。
+            start_date/end_date: 日期过滤区间；为空时不按日期过滤。
+            date_field: 日期字段名，默认 ``day``。
+            fields: 需要返回的字段；为空时返回整表字段。
+            filters: 额外等值过滤，如 ``{"link_id": 310003}``。
+            chunk_days: 按日期分段查询的自然日长度，用于规避单次返回行数上限。
+            limit: 单次查询返回行数上限。
+
+        Returns:
+            pandas.DataFrame: 官方表原始字段。
+        """
+        raise NotImplementedError(
+            f"{self.name} 未实现 get_finance_table，无法查询 {table_name}"
+        )
+
+    def get_ah_premium(
+        self,
+        start_date: Optional[Union[str, datetime]] = None,
+        end_date: Optional[Union[str, datetime]] = None,
+    ) -> pd.DataFrame:
+        """返回聚宽官方 ``finance.STK_AH_PRICE_COMP`` A/H 价格对比表。
+
+        默认实现调用 ``get_finance_table``；不支持 finance 表的数据源会抛
+        ``NotImplementedError``。字段固定为：
+        ``day/a_code/h_code/a_price/h_price/h_a_comp``。
+        """
+        return self.get_finance_table(
+            "STK_AH_PRICE_COMP",
+            start_date,
+            end_date,
+            date_field="day",
+            fields=["day", "a_code", "h_code", "a_price", "h_price", "h_a_comp"],
+        )
+
     def __getattr__(self, name: str):
         """
         当 provider 缺少某方法时，允许回退到同一 provider 的 SDK/客户端。

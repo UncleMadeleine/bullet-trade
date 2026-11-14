@@ -3,7 +3,7 @@ import json
 import logging
 import os
 from datetime import date as Date
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import pandas as pd
@@ -992,6 +992,134 @@ class JQDataProvider(DataProvider):
             return events
 
         return self._cache.cached_call('get_split_dividend', kwargs, _fetch, result_type='list_dict')
+
+    def get_finance_table(
+        self,
+        table_name: str,
+        start_date: Optional[Union[str, datetime]] = None,
+        end_date: Optional[Union[str, datetime]] = None,
+        *,
+        date_field: str = "day",
+        fields: Optional[List[str]] = None,
+        filters: Optional[Dict[str, Any]] = None,
+        chunk_days: int = 10,
+        limit: int = 3000,
+    ) -> pd.DataFrame:
+        """查询聚宽官方 ``finance.<table_name>`` 表。
+
+        聚宽 ``finance.run_query`` 单次最多返回 3000 行，AH 比价、
+        港股通持股等表按日累计很容易超限，因此默认按 ``chunk_days``
+        个自然日切段查询后拼接；某个分段仍然触达单次行数上限时，会继续
+        二分该日期区间，尽量避免静默截断。
+
+        Args:
+            table_name: 官方表名，例如 ``STK_AH_PRICE_COMP``。
+            start_date/end_date: 日期过滤区间；必须同时提供或同时为空。
+            date_field: 日期字段名，默认 ``day``。
+            fields: 需要返回的字段；为空时返回整表字段。
+            filters: 额外等值过滤，如 ``{"link_id": 310003}``。
+            chunk_days: 日期分段长度（自然日）。
+            limit: 单次查询返回行数上限，聚宽上限为 3000。
+
+        Returns:
+            pandas.DataFrame: 官方表原始字段；没有数据时返回空 DataFrame。
+        """
+        try:
+            table = getattr(finance, table_name, None)
+        except Exception as exc:
+            raise RuntimeError(
+                f"无法访问聚宽 finance 表 {table_name}；"
+                "请确认 JQData 已认证且账号有该表权限"
+            ) from exc
+        if table is None:
+            raise ValueError(
+                f"聚宽 finance 库没有表 {table_name}；"
+                "请检查表名或当前 JQData 版本"
+            )
+
+        start = self._to_date(start_date) if start_date is not None else None
+        end = self._to_date(end_date) if end_date is not None else None
+        if start_date is not None and start is None:
+            raise ValueError(f"start_date 非法: {start_date!r}")
+        if end_date is not None and end is None:
+            raise ValueError(f"end_date 非法: {end_date!r}")
+        if (start is None) != (end is None):
+            raise ValueError("start_date 与 end_date 必须同时提供")
+        if start is not None and end is not None and start > end:
+            raise ValueError(f"start_date {start} 晚于 end_date {end}")
+
+        field_names = list(fields) if fields else None
+        date_column = getattr(table, date_field, None)
+        if start is not None and date_column is None:
+            raise ValueError(f"表 {table_name} 没有日期字段 {date_field}")
+
+        extra_filters = list((filters or {}).items())
+        # 聚宽 finance.run_query 单次最多 3000 行；超过也不会返回更多。
+        single_limit = max(1, min(int(limit), 3000))
+
+        def _query_once(chunk_start: Optional[Date], chunk_end: Optional[Date]) -> pd.DataFrame:
+            columns = [getattr(table, name) for name in field_names] if field_names else []
+            statement = query(*columns) if columns else query(table)
+            if chunk_start is not None and chunk_end is not None:
+                statement = statement.filter(
+                    date_column >= chunk_start,
+                    date_column <= chunk_end,
+                )
+            for field, value in extra_filters:
+                column = getattr(table, field, None)
+                if column is None:
+                    raise ValueError(f"表 {table_name} 没有字段 {field}")
+                statement = statement.filter(column == value)
+            if date_column is not None:
+                statement = statement.order_by(date_column)
+            statement = statement.limit(single_limit)
+            result = finance.run_query(statement)
+            if result is None:
+                return pd.DataFrame()
+            return result
+
+        if start is None or end is None:
+            result = _query_once(None, None)
+            if len(result) >= single_limit:
+                logger.warning(
+                    "聚宽 finance 表 %s 未限定日期区间，返回达到 %d 行上限，"
+                    "结果可能被截断；建议传入 start_date/end_date",
+                    table_name,
+                    single_limit,
+                )
+            return result
+
+        def _query_range(chunk_start: Date, chunk_end: Date) -> List[pd.DataFrame]:
+            result = _query_once(chunk_start, chunk_end)
+            if result.empty:
+                return []
+            if len(result) < single_limit:
+                return [result]
+            # 触达单次上限时二分日期区间；单日仍超限只能告警。
+            if chunk_start >= chunk_end:
+                logger.warning(
+                    "聚宽 finance 表 %s 在 %s 单日返回达到 %d 行上限，"
+                    "结果可能被截断；请增加 filters 或缩小字段范围",
+                    table_name,
+                    chunk_start,
+                    single_limit,
+                )
+                return [result]
+            mid = chunk_start + timedelta(days=(chunk_end - chunk_start).days // 2)
+            return _query_range(chunk_start, mid) + _query_range(
+                mid + timedelta(days=1), chunk_end
+            )
+
+        frames: List[pd.DataFrame] = []
+        step = max(int(chunk_days), 1)
+        cursor = start
+        while cursor <= end:
+            chunk_end = min(cursor + timedelta(days=step - 1), end)
+            frames.extend(_query_range(cursor, chunk_end))
+            cursor = chunk_end + timedelta(days=1)
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
 
     def _manual_prefactor_fallback(
         self,

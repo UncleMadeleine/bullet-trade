@@ -269,6 +269,34 @@ set_data_provider('akshare')
 
 ⚠️ 直连会降低跨数据源可移植性，策略迁移时需自行处理兼容或降级。
 
+### 聚宽官方 finance 表
+
+JQData provider 额外实现了两个正式接口，用来读取聚宽官方 `finance` 表：
+
+```python
+from bullet_trade.data.api import get_data_provider
+
+provider = get_data_provider("jqdata")
+
+# 通用接口：表名 + 日期区间 + 字段 + 等值过滤
+df = provider.get_finance_table(
+    "STK_HK_HOLD_INFO",
+    "2024-01-01",
+    "2024-01-31",
+    date_field="day",
+    fields=["day", "link_id", "code", "share_ratio"],
+    filters={"link_id": 310001},
+)
+
+# AH 比价快捷接口：finance.STK_AH_PRICE_COMP
+ah = provider.get_ah_premium("2024-01-01", "2024-12-31")
+```
+
+`get_finance_table()` 会按 `chunk_days`（默认 10 个自然日）分段查询，避免
+`finance.run_query` 单次 3000 行上限截断；若某个分段仍然触达上限，会自动
+二分该日期区间，单日仍超限时输出 warning。`limit` 默认也是 3000。其它
+provider 未实现时抛 `NotImplementedError`，业务层可以据此降级或报错。
+
 ## ✅ 数据源对比测试
 
 用于验证不同 provider 的复权口径与数据一致性，建议在准备好账号与本地数据后执行：
