@@ -100,7 +100,7 @@ class DataProvider(ABC):
             limit: 单次查询返回行数上限。
 
         Returns:
-            pandas.DataFrame: 官方表原始字段。
+            pandas.DataFrame: 表数据；具体字段口径以各 provider 文档为准。
         """
         raise NotImplementedError(
             f"{self.name} 未实现 get_finance_table，无法查询 {table_name}"

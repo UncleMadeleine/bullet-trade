@@ -4,7 +4,8 @@ AKShare 数据源适配器
 文件职责：通过 akshare 公开接口提供聚宽兼容的免费行情数据。
 主要输入：聚宽风格证券代码、日期范围、频率、字段、复权参数。
 主要输出：聚宽兼容的 DataFrame、交易日列表、证券列表、指数成分、分红事件，
-以及估值与财务快照（PB/PE、市场PB分位、ROE/营收增速/行业）。
+以及估值与财务快照（PB/PE、市场PB分位、ROE/营收增速/行业）、AH 比价和
+沪深港通持股。
 上下游关系：由 bullet_trade.data.api 的 provider 工厂按显式名称 akshare 创建。
 关键约定：akshare 延迟导入；该数据源属于公开网页聚合，仅作为 Beta/补充源，
 历史证券列表和指数成分只能返回最新结果，不保证回测时点准确性。
@@ -13,6 +14,7 @@ AKShare 数据源适配器
 from __future__ import annotations
 
 import importlib
+import logging
 import math
 from datetime import date as Date
 from datetime import datetime
@@ -22,6 +24,8 @@ import pandas as pd
 
 from .base import DataProvider
 from ..cache import CacheManager
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_PRICE_FIELDS = ["open", "close", "high", "low", "volume", "money"]
 _PRICE_FIELDS = {"open", "close", "high", "low", "pre_close", "high_limit", "low_limit"}
@@ -66,6 +70,28 @@ _MINUTE_FREQUENCIES = {
 }
 _BARS_PER_DAY = {"1": 240, "5": 48, "15": 16, "30": 8, "60": 4}
 _INDEX_CODE_PREFIXES = ("000", "399", "899")
+_AH_PREMIUM_COLUMNS = ["day", "a_code", "h_code", "a_price", "h_price", "h_a_comp"]
+_HK_HOLD_COLUMNS = [
+    "day",
+    "link_id",
+    "link_name",
+    "code",
+    "name",
+    "share_number",
+    "share_ratio",
+]
+# 聚宽 finance.STK_HK_HOLD_INFO 的市场通编码 -> (akshare 接口参数, 名称)
+_HK_HOLD_MARKETS = {
+    310001: ("沪股通持股", "沪股通"),
+    310002: ("深股通持股", "深股通"),
+    310005: ("南向持股", "港股通"),
+}
+_HK_HOLD_LINK_NAMES = {
+    "沪股通": 310001,
+    "深股通": 310002,
+    "港股通": 310005,
+}
+_FINANCE_TABLE_NAMES = {"STK_AH_PRICE_COMP", "STK_HK_HOLD_INFO"}
 
 
 class AkshareProvider(DataProvider):
@@ -1235,3 +1261,589 @@ class AkshareProvider(DataProvider):
             if snapshot:
                 return snapshot
         return {}
+
+    # ------------------------ 市场通 / finance 表 ------------------------
+    @staticmethod
+    def _to_hk_code(code: Any) -> str:
+        """把港股代码统一为聚宽 5 位 ``.HK`` 形式。"""
+        raw = str(code).strip().upper()
+        if not raw:
+            return ""
+        if raw.endswith(".HK"):
+            raw = raw[:-3]
+        if raw.endswith(".0"):
+            raw = raw[:-2]
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if not digits:
+            return raw
+        return f"{digits.zfill(5)}.HK"
+
+    @classmethod
+    def _normalize_a_code(cls, code: Any) -> str:
+        """把 A 股代码（含后缀/市场前缀）规范为 6 位数字。"""
+        raw = cls._to_ak_symbol(str(code)).strip()
+        if raw.endswith(".0"):
+            raw = raw[:-2]
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        return digits.zfill(6) if digits else raw
+
+    def _resolve_finance_window(
+        self,
+        start_date: Optional[Union[str, datetime, Date]],
+        end_date: Optional[Union[str, datetime, Date]],
+        *,
+        table_name: str,
+        required: bool = False,
+    ) -> Tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+        """校验 finance 表接口的日期区间，返回规范化后的时间戳。"""
+        start = self._as_timestamp(start_date)
+        end = self._as_timestamp(end_date)
+        if start_date not in (None, "") and start is None:
+            raise ValueError(f"start_date 非法: {start_date!r}")
+        if end_date not in (None, "") and end is None:
+            raise ValueError(f"end_date 非法: {end_date!r}")
+        if (start is None) != (end is None):
+            raise ValueError("start_date 与 end_date 必须同时提供")
+        if required and start is None:
+            raise ValueError(
+                f"AKShare 查询 {table_name} 需要同时提供 start_date 与 end_date"
+            )
+        if start is not None and end is not None and start > end:
+            raise ValueError(
+                f"start_date {start.date()} 晚于 end_date {end.date()}"
+            )
+        return start, end
+
+    def _fetch_ah_spot(self) -> pd.DataFrame:
+        """拉取东财 AH 股实时比价快照并归一化为聚宽字段。"""
+        ak = self._ensure_akshare()
+        raw = pd.DataFrame(ak.stock_zh_ah_spot_em())
+        if raw.empty:
+            return pd.DataFrame(columns=_AH_PREMIUM_COLUMNS)
+        a_code_col = self._pick_column(raw, "A股代码")
+        h_code_col = self._pick_column(raw, "H股代码")
+        a_price_col = self._pick_column(raw, "最新价-RMB")
+        h_price_col = self._pick_column(raw, "最新价-HKD")
+        comp_col = self._pick_column(raw, "比价")
+        if any(
+            col is None
+            for col in (a_code_col, h_code_col, a_price_col, h_price_col, comp_col)
+        ):
+            raise ValueError(
+                f"AH 股比价快照缺少必要字段: {list(raw.columns)}"
+            )
+        result = pd.DataFrame(
+            {
+                "day": datetime.now().date(),
+                "a_code": raw[a_code_col].map(self._to_jq_code),
+                "h_code": raw[h_code_col].map(self._to_hk_code),
+                "a_price": pd.to_numeric(raw[a_price_col], errors="coerce"),
+                "h_price": pd.to_numeric(raw[h_price_col], errors="coerce"),
+                "h_a_comp": pd.to_numeric(raw[comp_col], errors="coerce"),
+            }
+        )
+        return self._finalize_ah_premium(result)
+
+    @staticmethod
+    def _finalize_ah_premium(df: pd.DataFrame) -> pd.DataFrame:
+        """统一 AH 比价表列顺序、日期类型并清理无效行。"""
+        if df.empty:
+            return pd.DataFrame(columns=_AH_PREMIUM_COLUMNS)
+        result = df.copy()
+        result["day"] = pd.to_datetime(result["day"], errors="coerce").dt.date
+        for column in ("a_price", "h_price", "h_a_comp"):
+            result[column] = pd.to_numeric(result[column], errors="coerce")
+        result = result.dropna(
+            subset=["day", "a_code", "h_code", "a_price", "h_price", "h_a_comp"]
+        )
+        result = result[_AH_PREMIUM_COLUMNS]
+        return result.sort_values(["day", "a_code"], ignore_index=True)
+
+    def get_ah_premium(
+        self,
+        start_date: Optional[Union[str, datetime, Date]] = None,
+        end_date: Optional[Union[str, datetime, Date]] = None,
+    ) -> pd.DataFrame:
+        """AKShare 版 AH 比价表，字段对齐聚宽 ``STK_AH_PRICE_COMP``。
+
+        无日期时返回东财实时快照（``day`` 记为调用当天）；给定日期区间时，
+        按当前 A/H 配对逐只拉取 A 股与 H 股不复权收盘价，并结合中行港币
+        折算价计算 ``h_a_comp = a_price / (h_price * 港币兑人民币汇率)``。
+
+        注意：AKShare 没有全市场 AH 历史比价接口，历史查询会逐只请求，
+        首次较慢且覆盖范围仅限调用时仍存在的 A/H 配对；结果走 CacheManager。
+        """
+        start, end = self._resolve_finance_window(
+            start_date, end_date, table_name="STK_AH_PRICE_COMP"
+        )
+        if start is None or end is None:
+            return self._cache.cached_call(
+                "get_ah_premium_spot",
+                {},
+                lambda _: self._fetch_ah_spot(),
+                result_type="df",
+            )
+        return self._fetch_ah_premium_range(start, end)
+
+    def _fetch_ah_premium_range(
+        self,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        a_codes: Optional[Sequence[str]] = None,
+        h_codes: Optional[Sequence[str]] = None,
+    ) -> pd.DataFrame:
+        """按当前配对逐只拼装 AH 历史比价。"""
+        spot = self._cache.cached_call(
+            "get_ah_premium_spot",
+            {},
+            lambda _: self._fetch_ah_spot(),
+            result_type="df",
+        )
+        if spot is None or spot.empty:
+            return pd.DataFrame(columns=_AH_PREMIUM_COLUMNS)
+        pairs = spot[["a_code", "h_code"]].drop_duplicates(ignore_index=True)
+        pairs["a_code"] = pairs["a_code"].map(self._normalize_a_code)
+        pairs["h_code"] = pairs["h_code"].map(self._to_hk_code)
+        if a_codes:
+            wanted_a = {self._normalize_a_code(code) for code in a_codes}
+            pairs = pairs[pairs["a_code"].isin(wanted_a)]
+        if h_codes:
+            wanted_h = {self._to_hk_code(code) for code in h_codes}
+            pairs = pairs[pairs["h_code"].isin(wanted_h)]
+        if pairs.empty:
+            return pd.DataFrame(columns=_AH_PREMIUM_COLUMNS)
+
+        fx = self._fetch_hkd_cny(start, end)
+        if fx.empty:
+            raise ValueError(
+                "无法获取港币兑人民币汇率，AKShare 无法计算 AH 历史比价"
+            )
+        fx = fx.copy()
+        fx["day"] = pd.to_datetime(fx["day"], errors="coerce").dt.normalize()
+        fx = fx.dropna(subset=["day"]).drop_duplicates("day", keep="last")
+        fx_map = dict(zip(fx["day"], fx["rate"]))
+
+        frames: List[pd.DataFrame] = []
+        skipped: List[str] = []
+        for _, pair in pairs.iterrows():
+            a_symbol = str(pair["a_code"])
+            h_symbol = str(pair["h_code"])
+            try:
+                a_daily = self._fetch_ah_a_daily(a_symbol, start, end)
+                h_daily = self._fetch_ah_h_daily(h_symbol, start, end)
+            except Exception:  # noqa: BLE001 - 单只失败不应中断全市场
+                skipped.append(a_symbol)
+                continue
+            if a_daily.empty or h_daily.empty:
+                continue
+            a_daily = a_daily.copy()
+            h_daily = h_daily.copy()
+            a_daily["day"] = pd.to_datetime(a_daily["day"], errors="coerce").dt.normalize()
+            h_daily["day"] = pd.to_datetime(h_daily["day"], errors="coerce").dt.normalize()
+            merged = a_daily.merge(h_daily, on="day", how="inner")
+            if merged.empty:
+                continue
+            merged = merged.sort_values("day").reset_index(drop=True)
+            merged["rate"] = merged["day"].map(fx_map)
+            merged["rate"] = merged["rate"].ffill().bfill()
+            merged = merged.dropna(subset=["a_price", "h_price", "rate"])
+            if merged.empty:
+                continue
+            merged["a_code"] = self._to_jq_code(a_symbol)
+            merged["h_code"] = self._to_hk_code(h_symbol)
+            merged["h_a_comp"] = merged["a_price"] / (
+                merged["h_price"] * merged["rate"]
+            )
+            frames.append(merged[_AH_PREMIUM_COLUMNS])
+        if skipped:
+            logger.warning(
+                "AKShare AH 比价历史有 %d/%d 只标的拉取失败，已跳过: %s",
+                len(skipped),
+                len(pairs),
+                ", ".join(skipped[:10]),
+            )
+        if not frames:
+            return pd.DataFrame(columns=_AH_PREMIUM_COLUMNS)
+        result = pd.concat(frames, ignore_index=True)
+        result = result.replace([float("inf"), float("-inf")], pd.NA)
+        return self._finalize_ah_premium(result)
+
+    def _fetch_ah_a_daily(
+        self, a_symbol: str, start: pd.Timestamp, end: pd.Timestamp
+    ) -> pd.DataFrame:
+        """拉取单只 A 股不复权日线收盘价。"""
+
+        def _fetch(kw: Dict[str, Any]) -> pd.DataFrame:
+            ak = self._ensure_akshare()
+            raw = pd.DataFrame(
+                ak.stock_zh_a_hist(
+                    symbol=kw["symbol"].zfill(6),
+                    period="daily",
+                    start_date=kw["start_date"],
+                    end_date=kw["end_date"],
+                    adjust="",
+                )
+            )
+            if raw.empty:
+                return pd.DataFrame(columns=["day", "a_price"])
+            date_col = self._pick_column(raw, "日期", "date")
+            close_col = self._pick_column(raw, "收盘", "close")
+            if date_col is None or close_col is None:
+                raise ValueError(
+                    f"A 股日线缺少日期/收盘字段: {list(raw.columns)}"
+                )
+            return pd.DataFrame(
+                {
+                    "day": pd.to_datetime(raw[date_col], errors="coerce").dt.date,
+                    "a_price": pd.to_numeric(raw[close_col], errors="coerce"),
+                }
+            ).dropna(subset=["day", "a_price"])
+
+        return self._cache.cached_call(
+            "get_ah_a_daily",
+            {
+                "symbol": a_symbol,
+                "start_date": start.strftime("%Y%m%d"),
+                "end_date": end.strftime("%Y%m%d"),
+            },
+            _fetch,
+            result_type="df",
+        )
+
+    def _fetch_ah_h_daily(
+        self, h_symbol: str, start: pd.Timestamp, end: pd.Timestamp
+    ) -> pd.DataFrame:
+        """拉取单只 H 股不复权日线收盘价（港币）。"""
+
+        def _fetch(kw: Dict[str, Any]) -> pd.DataFrame:
+            ak = self._ensure_akshare()
+            raw = pd.DataFrame(
+                ak.stock_hk_hist(
+                    symbol=kw["symbol"],
+                    period="daily",
+                    start_date=kw["start_date"],
+                    end_date=kw["end_date"],
+                    adjust="",
+                )
+            )
+            if raw.empty:
+                return pd.DataFrame(columns=["day", "h_price"])
+            date_col = self._pick_column(raw, "日期", "date")
+            close_col = self._pick_column(raw, "收盘", "close")
+            if date_col is None or close_col is None:
+                raise ValueError(
+                    f"H 股日线缺少日期/收盘字段: {list(raw.columns)}"
+                )
+            return pd.DataFrame(
+                {
+                    "day": pd.to_datetime(raw[date_col], errors="coerce").dt.date,
+                    "h_price": pd.to_numeric(raw[close_col], errors="coerce"),
+                }
+            ).dropna(subset=["day", "h_price"])
+
+        return self._cache.cached_call(
+            "get_ah_h_daily",
+            {
+                "symbol": self._to_hk_code(h_symbol).replace(".HK", ""),
+                "start_date": start.strftime("%Y%m%d"),
+                "end_date": end.strftime("%Y%m%d"),
+            },
+            _fetch,
+            result_type="df",
+        )
+
+    def _fetch_hkd_cny(
+        self, start: pd.Timestamp, end: pd.Timestamp
+    ) -> pd.DataFrame:
+        """拉取港币兑人民币中行折算价，返回 day/rate（CNY per HKD）。"""
+
+        def _fetch(kw: Dict[str, Any]) -> pd.DataFrame:
+            ak = self._ensure_akshare()
+            raw = pd.DataFrame(
+                ak.currency_boc_sina(
+                    symbol="港币",
+                    start_date=kw["start_date"],
+                    end_date=kw["end_date"],
+                )
+            )
+            if raw.empty:
+                return pd.DataFrame(columns=["day", "rate"])
+            date_col = self._pick_column(raw, "日期", "date")
+            rate_col = self._pick_column(
+                raw, "中行折算价", "央行中间价", "中行钞卖价/汇卖价"
+            )
+            if date_col is None or rate_col is None:
+                raise ValueError(
+                    f"港币汇率缺少日期/折算价字段: {list(raw.columns)}"
+                )
+            rate = pd.to_numeric(raw[rate_col], errors="coerce")
+            median = rate.dropna().median()
+            scale = 100.0 if pd.notna(median) and median > 10 else 1.0
+            return pd.DataFrame(
+                {
+                    "day": pd.to_datetime(raw[date_col], errors="coerce").dt.date,
+                    "rate": rate / scale,
+                }
+            ).dropna(subset=["day", "rate"])
+
+        return self._cache.cached_call(
+            "get_hkd_cny",
+            {
+                "start_date": start.strftime("%Y%m%d"),
+                "end_date": end.strftime("%Y%m%d"),
+            },
+            _fetch,
+            result_type="df",
+        )
+
+    @staticmethod
+    def _resolve_hk_hold_links(filters: Dict[str, Any]) -> List[int]:
+        """从过滤器解析需要查询的市场通编码。"""
+        value = filters.get("link_id")
+        if value is None:
+            value = filters.get("link_name")
+        if value is None:
+            return [310001, 310002]
+        items = value if isinstance(value, (list, tuple, set)) else [value]
+        links: List[int] = []
+        for item in items:
+            if isinstance(item, str) and not item.strip().isdigit():
+                link = _HK_HOLD_LINK_NAMES.get(item.strip())
+                if link is None:
+                    raise ValueError(
+                        f"不支持的市场通名称 {item!r}；可选: 沪股通/深股通/港股通"
+                    )
+            else:
+                link = int(item)
+            if link not in _HK_HOLD_MARKETS:
+                raise ValueError(
+                    f"不支持的市场通编码 {link}；可选: 310001/310002/310005"
+                )
+            links.append(link)
+        return list(dict.fromkeys(links))
+
+    def _fetch_hk_hold_market(
+        self,
+        link_id: int,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+    ) -> pd.DataFrame:
+        """拉取单个市场通的每日个股持股数据并归一化为聚宽字段。"""
+        symbol, link_name = _HK_HOLD_MARKETS[link_id]
+
+        def _fetch(kw: Dict[str, Any]) -> pd.DataFrame:
+            ak = self._ensure_akshare()
+            raw = pd.DataFrame(
+                ak.stock_hsgt_stock_statistics_em(
+                    symbol=kw["symbol"],
+                    start_date=kw["start_date"],
+                    end_date=kw["end_date"],
+                )
+            )
+            if raw.empty:
+                return pd.DataFrame(columns=_HK_HOLD_COLUMNS)
+            day_col = self._pick_column(raw, "持股日期", "日期")
+            code_col = self._pick_column(raw, "股票代码", "代码")
+            name_col = self._pick_column(raw, "股票简称", "名称")
+            number_col = self._pick_column(raw, "持股数量")
+            ratio_col = self._pick_column(raw, "持股数量占发行股百分比")
+            if any(
+                col is None
+                for col in (day_col, code_col, name_col, number_col, ratio_col)
+            ):
+                raise ValueError(
+                    "沪深港通持股缺少日期/代码/名称/股数/比例字段: "
+                    f"{list(raw.columns)}"
+                )
+            if kw["link_id"] == 310005:
+                codes = raw[code_col].map(self._to_hk_code)
+            else:
+                codes = raw[code_col].map(self._to_jq_code)
+            return pd.DataFrame(
+                {
+                    "day": pd.to_datetime(raw[day_col], errors="coerce").dt.date,
+                    "link_id": int(kw["link_id"]),
+                    "link_name": kw["link_name"],
+                    "code": codes,
+                    "name": raw[name_col].fillna("").astype(str),
+                    "share_number": pd.to_numeric(raw[number_col], errors="coerce"),
+                    "share_ratio": pd.to_numeric(raw[ratio_col], errors="coerce"),
+                }
+            ).dropna(subset=["day", "code"])
+
+        return self._cache.cached_call(
+            "get_hk_hold_info",
+            {
+                "link_id": link_id,
+                "link_name": link_name,
+                "symbol": symbol,
+                "start_date": start.strftime("%Y%m%d"),
+                "end_date": end.strftime("%Y%m%d"),
+            },
+            _fetch,
+            result_type="df",
+        )
+
+    def _fetch_hk_hold(
+        self,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        link_ids: Sequence[int],
+    ) -> pd.DataFrame:
+        """按市场通编码拉取持股数据并拼接。"""
+        frames = [
+            frame
+            for frame in (
+                self._fetch_hk_hold_market(link_id, start, end)
+                for link_id in link_ids
+            )
+            if frame is not None and not frame.empty
+        ]
+        if not frames:
+            return pd.DataFrame(columns=_HK_HOLD_COLUMNS)
+        result = pd.concat(frames, ignore_index=True)
+        result["day"] = pd.to_datetime(result["day"], errors="coerce").dt.date
+        result = result.dropna(subset=["day", "code"])
+        result = result.sort_values(["day", "link_id", "code"], ignore_index=True)
+        return result[_HK_HOLD_COLUMNS]
+
+    @staticmethod
+    def _finance_filter_values(
+        filters: Dict[str, Any], key: str
+    ) -> Optional[List[str]]:
+        """取出用于预筛选的过滤值，统一为字符串列表。"""
+        value = filters.get(key)
+        if value is None:
+            return None
+        items = value if isinstance(value, (list, tuple, set)) else [value]
+        return [str(item) for item in items]
+
+    @staticmethod
+    def _apply_finance_filters(
+        df: pd.DataFrame, filters: Dict[str, Any]
+    ) -> pd.DataFrame:
+        """对 finance 表结果做等值/集合过滤。"""
+        result = df
+        for key, value in filters.items():
+            if key not in result.columns:
+                raise ValueError(
+                    f"finance 表结果没有字段 {key}；可用字段: {list(result.columns)}"
+                )
+            if key in ("day", "date"):
+                column = pd.to_datetime(result[key], errors="coerce").dt.normalize()
+                if isinstance(value, (list, tuple, set)):
+                    wanted = pd.to_datetime(list(value), errors="coerce").normalize()
+                    result = result[column.isin(wanted)]
+                else:
+                    wanted = pd.to_datetime(value, errors="coerce").normalize()
+                    result = result[column == wanted]
+                continue
+            if isinstance(value, (list, tuple, set)):
+                result = result[result[key].isin(list(value))]
+            else:
+                result = result[result[key] == value]
+        return result.reset_index(drop=True)
+
+    @staticmethod
+    def _select_finance_fields(
+        df: pd.DataFrame, fields: Optional[Sequence[str]]
+    ) -> pd.DataFrame:
+        """按请求字段裁剪结果列。"""
+        if not fields:
+            return df
+        wanted = list(fields)
+        missing = [name for name in wanted if name not in df.columns]
+        if missing:
+            raise ValueError(
+                f"finance 表结果缺少字段 {missing}；可用字段: {list(df.columns)}"
+            )
+        return df[wanted].reset_index(drop=True)
+
+    def get_finance_table(
+        self,
+        table_name: str,
+        start_date: Optional[Union[str, datetime, Date]] = None,
+        end_date: Optional[Union[str, datetime, Date]] = None,
+        *,
+        date_field: str = "day",
+        fields: Optional[List[str]] = None,
+        filters: Optional[Dict[str, Any]] = None,
+        chunk_days: int = 10,
+        limit: int = 3000,
+    ) -> pd.DataFrame:
+        """AKShare 版 finance 表接口（能力有限的兼容实现）。
+
+        支持的表名：
+
+        - ``STK_AH_PRICE_COMP``：映射 :meth:`get_ah_premium`，字段为
+          day/a_code/h_code/a_price/h_price/h_a_comp；
+        - ``STK_HK_HOLD_INFO``：映射东财沪深港通持股，字段为
+          day/link_id/link_name/code/name/share_number/share_ratio；
+          支持 ``filters={"link_id": 310001}``（310001/310002/310005）或
+          ``filters={"link_name": "沪股通"}``。
+
+        ``date_field``/``chunk_days``/``limit`` 仅为签名兼容，AKShare 接口
+        自行分页；``fields`` 和 ``filters`` 在结果上生效。其它表名抛
+        ``NotImplementedError``。北向持股自 2024-08-20 起交易所停止发布。
+        """
+        _ = date_field, chunk_days, limit
+        name = str(table_name or "").strip().upper()
+        if name not in _FINANCE_TABLE_NAMES:
+            supported = "、".join(sorted(_FINANCE_TABLE_NAMES))
+            raise NotImplementedError(
+                f"AKShare provider 不支持 finance 表 {table_name}；"
+                f"当前支持: {supported}"
+            )
+        filter_dict = {str(key): value for key, value in (filters or {}).items()}
+
+        if name == "STK_AH_PRICE_COMP":
+            start, end = self._resolve_finance_window(
+                start_date, end_date, table_name=name
+            )
+            a_filter = self._finance_filter_values(filter_dict, "a_code")
+            h_filter = self._finance_filter_values(filter_dict, "h_code")
+            if start is None or end is None:
+                df = self._cache.cached_call(
+                    "get_ah_premium_spot",
+                    {},
+                    lambda _: self._fetch_ah_spot(),
+                    result_type="df",
+                )
+                if a_filter:
+                    wanted_a = {
+                        self._to_jq_code(self._normalize_a_code(code))
+                        for code in a_filter
+                    }
+                    df = df[df["a_code"].isin(wanted_a)]
+                if h_filter:
+                    wanted_h = {self._to_hk_code(code) for code in h_filter}
+                    df = df[df["h_code"].isin(wanted_h)]
+            else:
+                df = self._fetch_ah_premium_range(
+                    start, end, a_filter, h_filter
+                )
+            # a_code/h_code 已在取数阶段按规范化代码筛选，避免用户传入
+            # 无后缀代码时二次精确匹配失败。
+            post_filters = {
+                key: value
+                for key, value in filter_dict.items()
+                if key not in ("a_code", "h_code")
+            }
+        else:
+            start, end = self._resolve_finance_window(
+                start_date, end_date, table_name=name, required=True
+            )
+            assert start is not None and end is not None
+            df = self._fetch_hk_hold(
+                start, end, self._resolve_hk_hold_links(filter_dict)
+            )
+            post_filters = {
+                key: value
+                for key, value in filter_dict.items()
+                if key not in ("link_id", "link_name")
+            }
+
+        result = self._apply_finance_filters(df, post_filters)
+        return self._select_finance_fields(result, fields)
+
+

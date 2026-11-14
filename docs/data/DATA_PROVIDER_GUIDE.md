@@ -297,6 +297,49 @@ ah = provider.get_ah_premium("2024-01-01", "2024-12-31")
 二分该日期区间，单日仍超限时输出 warning。`limit` 默认也是 3000。其它
 provider 未实现时抛 `NotImplementedError`，业务层可以据此降级或报错。
 
+### AKShare 的 finance 表兼容实现
+
+AKShare 不是表数据库，`AkshareProvider` 只映射了有限的表名，其余表名抛
+`NotImplementedError`：
+
+| 表名 | 数据来源 | 输出字段 |
+| --- | --- | --- |
+| `STK_AH_PRICE_COMP` | 东财 AH 比价 / A、H 日线 + 中行港币折算价 | `day/a_code/h_code/a_price/h_price/h_a_comp` |
+| `STK_HK_HOLD_INFO` | 东财沪深港通持股 | `day/link_id/link_name/code/name/share_number/share_ratio` |
+
+```python
+from bullet_trade.data.api import get_data_provider
+
+provider = get_data_provider("akshare")
+
+# 无日期 -> 东财实时 AH 快照；有日期 -> 按当前 A/H 配对逐只拼历史比价
+ah_snapshot = provider.get_ah_premium()
+ah_history = provider.get_finance_table(
+    "STK_AH_PRICE_COMP",
+    "2024-01-01",
+    "2024-12-31",
+    fields=["day", "a_code", "h_a_comp"],
+    filters={"a_code": "600036.XSHG"},
+)
+
+# 沪深港通持股：310001 沪股通 / 310002 深股通 / 310005 港股通
+hold = provider.get_finance_table(
+    "STK_HK_HOLD_INFO",
+    "2024-01-02",
+    "2024-01-31",
+    filters={"link_id": 310001},
+)
+```
+
+口径与限制：
+
+- `h_a_comp = a_price / (h_price * 港币兑人民币汇率)`，汇率取新浪中行折算价，
+  与聚宽/东财实时快照可能有小幅差异；
+- AKShare 没有全市场 AH 历史比价接口，历史查询会逐只请求 A/H 日线，首次较慢，
+  且只覆盖调用时仍存在的 A/H 配对（存在幸存者偏差）；
+- 北向持股数据自 2024-08-20 起交易所停止发布，之后日期返回空表；
+- `date_field`/`chunk_days`/`limit` 仅保留签名兼容，AKShare 接口自行分页。
+
 ## ✅ 数据源对比测试
 
 用于验证不同 provider 的复权口径与数据一致性，建议在准备好账号与本地数据后执行：

@@ -276,6 +276,64 @@ class FakeAk:
             ]
         )
 
+    def stock_zh_ah_spot_em(self) -> pd.DataFrame:
+        """返回一行 AH 比价快照。"""
+        self.calls.append(("stock_zh_ah_spot_em", {}))
+        return pd.DataFrame(
+            [
+                {
+                    "名称": "招商银行",
+                    "H股代码": "03968",
+                    "最新价-HKD": 28.0,
+                    "H股-涨跌幅": 0.01,
+                    "A股代码": "600036",
+                    "最新价-RMB": 32.0,
+                    "A股-涨跌幅": 0.02,
+                    "比价": 1.26,
+                    "溢价": 0.26,
+                }
+            ]
+        )
+
+    def stock_hk_hist(self, **kwargs) -> pd.DataFrame:
+        """返回两行港股日线。"""
+        self.calls.append(("stock_hk_hist", kwargs))
+        return pd.DataFrame(
+            [
+                {"日期": "2024-01-02", "收盘": 28.0},
+                {"日期": "2024-01-03", "收盘": 28.5},
+            ]
+        )
+
+    def currency_boc_sina(self, **kwargs) -> pd.DataFrame:
+        """返回两行港币中行折算价（单位：CNY/100HKD）。"""
+        self.calls.append(("currency_boc_sina", kwargs))
+        return pd.DataFrame(
+            [
+                {"日期": "2024-01-02", "中行折算价": 90.0},
+                {"日期": "2024-01-03", "中行折算价": 90.5},
+            ]
+        )
+
+    def stock_hsgt_stock_statistics_em(self, **kwargs) -> pd.DataFrame:
+        """返回沪深港通个股持股；南向返回港股代码。"""
+        self.calls.append(("stock_hsgt_stock_statistics_em", kwargs))
+        code = "00700" if kwargs.get("symbol") == "南向持股" else "600036"
+        return pd.DataFrame(
+            [
+                {
+                    "持股日期": "2024-01-02",
+                    "股票代码": code,
+                    "股票简称": "招商银行",
+                    "当日收盘价": 32.0,
+                    "当日涨跌幅": 0.02,
+                    "持股数量": 100,
+                    "持股市值": 3200.0,
+                    "持股数量占发行股百分比": 1.5,
+                }
+            ]
+        )
+
 
 def _provider() -> AkshareProvider:
     """创建注入 fake akshare 的 provider。"""
@@ -590,3 +648,186 @@ def test_akshare_financial_snapshot_accepts_explicit_period() -> None:
     ak = provider._ensure_akshare()
     used = [kwargs.get("date") for name, kwargs in ak.calls if name == "stock_yjbb_em"]
     assert used == ["20260630"]
+
+
+@pytest.mark.unit
+def test_akshare_ah_premium_snapshot_maps_official_fields() -> None:
+    """AH 快照应归一化为聚宽 STK_AH_PRICE_COMP 字段。"""
+    provider = _provider()
+
+    df = provider.get_ah_premium()
+
+    assert list(df.columns) == [
+        "day",
+        "a_code",
+        "h_code",
+        "a_price",
+        "h_price",
+        "h_a_comp",
+    ]
+    row = df.iloc[0]
+    assert row["day"] == date.today()
+    assert row["a_code"] == "600036.XSHG"
+    assert row["h_code"] == "03968.HK"
+    assert row["a_price"] == 32.0
+    assert row["h_price"] == 28.0
+    assert row["h_a_comp"] == pytest.approx(1.26)
+
+
+@pytest.mark.unit
+def test_akshare_ah_premium_history_uses_close_and_fx() -> None:
+    """历史 AH 比价应由 A/H 收盘价与港币折算价计算。"""
+    provider = _provider()
+
+    df = provider.get_ah_premium("2024-01-02", "2024-01-03")
+
+    assert len(df) == 2
+    assert list(df.columns) == [
+        "day",
+        "a_code",
+        "h_code",
+        "a_price",
+        "h_price",
+        "h_a_comp",
+    ]
+    assert df["a_price"].tolist() == [10.2, 10.4]
+    assert df["h_price"].tolist() == [28.0, 28.5]
+    assert df["h_a_comp"].iloc[0] == pytest.approx(10.2 / (28.0 * 0.90))
+    assert df["h_a_comp"].iloc[1] == pytest.approx(10.4 / (28.5 * 0.905))
+
+
+@pytest.mark.unit
+def test_akshare_ah_premium_requires_both_dates() -> None:
+    """只给一端日期时应直接报错。"""
+    provider = _provider()
+
+    with pytest.raises(ValueError, match="必须同时提供"):
+        provider.get_ah_premium("2024-01-02")
+
+
+@pytest.mark.unit
+def test_akshare_finance_table_ah_premium_filters_by_code() -> None:
+    """get_finance_table 应支持 AH 表并按代码预筛选、裁剪字段。"""
+    provider = _provider()
+
+    df = provider.get_finance_table(
+        "STK_AH_PRICE_COMP",
+        "2024-01-02",
+        "2024-01-03",
+        fields=["day", "a_code", "h_a_comp"],
+        filters={"a_code": "600036.XSHG"},
+    )
+
+    assert list(df.columns) == ["day", "a_code", "h_a_comp"]
+    assert len(df) == 2
+    assert set(df["a_code"]) == {"600036.XSHG"}
+
+
+@pytest.mark.unit
+def test_akshare_finance_table_accepts_unsuffixed_code_filter() -> None:
+    """代码过滤不要求调用方补聚宽后缀。"""
+    provider = _provider()
+
+    df = provider.get_finance_table(
+        "STK_AH_PRICE_COMP",
+        "2024-01-02",
+        "2024-01-03",
+        filters={"a_code": "600036"},
+    )
+
+    assert set(df["a_code"]) == {"600036.XSHG"}
+
+
+@pytest.mark.unit
+def test_akshare_finance_table_hk_hold_maps_link_id() -> None:
+    """沪深港通持股应按 link_id 映射市场并补齐 link_name。"""
+    provider = _provider()
+
+    df = provider.get_finance_table(
+        "STK_HK_HOLD_INFO",
+        "2024-01-02",
+        "2024-01-02",
+        filters={"link_id": 310001},
+        fields=["day", "link_id", "link_name", "code", "share_number"],
+    )
+
+    assert list(df.columns) == [
+        "day",
+        "link_id",
+        "link_name",
+        "code",
+        "share_number",
+    ]
+    row = df.iloc[0]
+    assert row["link_id"] == 310001
+    assert row["link_name"] == "沪股通"
+    assert row["code"] == "600036.XSHG"
+    assert row["share_number"] == 100
+
+
+@pytest.mark.unit
+def test_akshare_finance_table_hk_hold_southbound_uses_hk_code() -> None:
+    """港股通持股应输出 .HK 代码，并支持 link_name 过滤。"""
+    provider = _provider()
+
+    df = provider.get_finance_table(
+        "STK_HK_HOLD_INFO",
+        "2024-01-02",
+        "2024-01-02",
+        filters={"link_name": "港股通"},
+        fields=["link_name", "code"],
+    )
+
+    assert df.iloc[0]["link_name"] == "港股通"
+    assert df.iloc[0]["code"] == "00700.HK"
+
+
+@pytest.mark.unit
+def test_akshare_finance_table_requires_dates_for_hk_hold() -> None:
+    """沪深港通持股没有无日期的快照模式。"""
+    provider = _provider()
+
+    with pytest.raises(ValueError, match="需要同时提供"):
+        provider.get_finance_table("STK_HK_HOLD_INFO")
+
+
+@pytest.mark.unit
+def test_akshare_finance_table_rejects_unknown_table() -> None:
+    """未映射的 finance 表应抛 NotImplementedError。"""
+    provider = _provider()
+
+    with pytest.raises(NotImplementedError, match="不支持"):
+        provider.get_finance_table("STK_XR_XD", "2024-01-02", "2024-01-03")
+
+
+@pytest.mark.unit
+def test_akshare_finance_table_ah_snapshot_applies_code_filter() -> None:
+    """无日期走快照时，a_code 过滤也应生效。"""
+    provider = _provider()
+
+    df = provider.get_finance_table(
+        "STK_AH_PRICE_COMP", filters={"a_code": "600036"}
+    )
+
+    assert set(df["a_code"]) == {"600036.XSHG"}
+
+    empty = provider.get_finance_table(
+        "STK_AH_PRICE_COMP", filters={"a_code": "000001"}
+    )
+    assert empty.empty
+
+
+@pytest.mark.unit
+def test_akshare_finance_table_normalizes_day_filter() -> None:
+    """day 过滤允许传入日期字符串。"""
+    provider = _provider()
+
+    df = provider.get_finance_table(
+        "STK_AH_PRICE_COMP",
+        "2024-01-02",
+        "2024-01-03",
+        filters={"day": "2024-01-02"},
+    )
+
+    assert len(df) == 1
+    assert df.iloc[0]["day"] == date(2024, 1, 2)

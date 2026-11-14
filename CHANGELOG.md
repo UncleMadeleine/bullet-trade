@@ -7,6 +7,7 @@
 
 ### 新增
 - **聚宽 finance 表通用接口**：`DataProvider` 新增 `get_finance_table()` 和 `get_ah_premium()`；JQData provider 用 `finance.run_query` 实现，支持表名、日期区间、字段、等值过滤和按日分段（规避单次 3000 行上限，触达上限时自动二分日期区间）。AH 比价、港股通汇率、沪深港通持股等官方表可直接通过统一 provider 接口读取，不再需要业务层直接访问 `provider.finance`。
+- **AKShare finance 表兼容**：`AkshareProvider` 实现 `get_ah_premium()` 和 `get_finance_table()`，映射 `STK_AH_PRICE_COMP`（实时快照或按 A/H 日线+汇率计算历史比价）与 `STK_HK_HOLD_INFO`（沪股通/深股通/港股通持股，支持 `link_id` 过滤），字段与聚宽口径对齐；未映射表名抛 `NotImplementedError`。
 
 ## [0.10.0] - 2026-09-24
 
