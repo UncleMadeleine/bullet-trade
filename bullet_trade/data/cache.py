@@ -27,10 +27,15 @@ class CacheManager:
     ) -> None:
         self.provider_name = provider_name or "unknown"
         if cache_dir is not None:
-            self.cache_dir = cache_dir
+            # 显式 cache_dir 视为缓存根目录；provider 子目录在 _resolve_paths 统一拼接。
+            # 兼容 env_loader 已经拼好 provider 的配置（DATA_CACHE_DIR/akshare），
+            # 避免出现 DATA_CACHE_DIR/akshare/akshare 的重复目录。
+            normalized = os.path.normpath(str(cache_dir)) if str(cache_dir) else ""
+            if normalized and os.path.basename(normalized) == self.provider_name:
+                normalized = os.path.dirname(normalized)
+            self.cache_dir = normalized
         elif fallback_to_env:
-            base_dir = os.getenv("DATA_CACHE_DIR", "")
-            self.cache_dir = os.path.join(base_dir, self.provider_name) if base_dir else ""
+            self.cache_dir = os.getenv("DATA_CACHE_DIR", "")
         else:
             self.cache_dir = ""
         self.enabled = bool(self.cache_dir)
